@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPU 软件栈与 CUDA · 面试准备</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="gpu">
+<div id="topbar" data-base="../"></div>
+<div style="position:sticky;top:56px;z-index:49;height:3px;background:transparent"><i id="read-bar" style="display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--purple))"></i></div>
+
+<div class="wrap">
+<div class="layout">
+  <aside class="sidebar"><div id="toc"></div></aside>
+
+  <main class="content">
+    <h1>GPU 软件栈与 CUDA</h1>
+    <p style="color:var(--text-dim);font-size:15.5px">
+      这一页的主角是 <strong>软件怎么驾驭 GPU</strong>，不是怎么写 kernel。
+      做过用户态驱动的同学，这里的 UMD/KMD 分界、命令提交、内存管理、同步机制，
+      应该有一半是每天在打交道的 —— 面试要做的就是把经验翻译成对方听得懂的语言。
+    </p>
+
+    <div class="box warn">
+      <span class="box-title">先划清边界</span>
+      不考算子：不写 <code>__global__</code> kernel，不做 shared memory 优化，不调 tile size。
+      考的是：CUDA 上下文怎么建立、命令怎么提交到硬件、显存怎么分配和迁移、
+      流和事件的同步语义是什么、多进程多卡怎么协调。
+      <strong>"软件怎么把工作交给硬件并保证正确"</strong> —— 这就是驱动岗的视角。
+    </div>
+
+    <h2 id="arch">GPU 架构：为什么它快</h2>
+    <p>
+      CPU 用大量面积做缓存和乱序控制，追求<strong>单线程延迟</strong>；
+      GPU 把面积几乎全给了 ALU，用海量线程和<strong>延迟隐藏</strong>换吞吐。
+      这个区别决定了整个软件栈的设计。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>维度</th><th>CPU</th><th>GPU</th></tr></thead>
+        <tbody>
+          <tr><td>核心数</td><td>几十个</td><td>几千到上万个</td></tr>
+          <tr><td>单核复杂度</td><td>乱序、分支预测、大 cache</td><td>顺序、简单、小 cache</td></tr>
+          <tr><td>优化目标</td><td>降低延迟</td><td>提高吞吐</td></tr>
+          <tr><td>内存</td><td>DDR，几 TB/s 级（多通道）</td><td>HBM，几 TB/s</td></tr>
+          <tr><td>切换成本</td><td>微秒级</td><td>几十周期（warp 级别）</td></tr>
+          <tr><td>典型瓶颈</td><td>分支、cache miss</td><td>内存带宽、寄存器、占用率</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 id="sm">SM 与 warp：执行的基本单位</h3>
+    <p>
+      NVIDIA 的层次是 <strong>Grid → Block → Warp → Thread</strong>。
+      硬件上，一个 SM（Streaming Multiprocessor）有若干 warp scheduler，
+      每个调度器管一个 warp（32 个线程），以 <strong>warp 为单位</strong>发射指令 —— 这叫作 SIMT。
+    </p>
+    <ul>
+      <li>一个 block 被调度到一个 SM 上，block 内的 warp 分给 SM 的各个 scheduler。</li>
+      <li>warp 内 32 个线程如果走不同分支，会串行执行两个分支（分支发散）。</li>
+      <li><strong>占用率（occupancy）</strong> = 活跃 warp 数 / 硬件上限，受寄存器、shared memory、block 大小限制。</li>
+      <li>一个 warp 的指令延迟靠切换到其他 warp 来隐藏 —— 所以 warp 越多越好（但受资源限制）。</li>
+    </ul>
+    <div class="box">
+      <span class="box-title">为什么共享内存是按 block 分配的</span>
+      shared memory 是 SM 上的片上资源，只有同一个 block 内的线程能共享，
+      因为 block 保证在同一个 SM 上执行。不同 block 之间不能共享 shared memory，
+      这是硬件决定的，不是软件限制。
+    </div>
+
+    <h3 id="hbm">显存与内存层次</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>层级</th><th>位置</th><th>延迟</th><th>谁能访问</th></tr></thead>
+        <tbody>
+          <tr><td>寄存器</td><td>SM 内</td><td>~1 cycle</td><td>线程私有</td></tr>
+          <tr><td>Shared Memory / L1</td><td>SM 内（可配置划分）</td><td>~20-30 cycle</td><td>block 内共享</td></tr>
+          <tr><td>L2 Cache</td><td>芯片上，全 GPU 共享</td><td>~200 cycle</td><td>全局</td></tr>
+          <tr><td>HBM 显存</td><td>封装内（HBM）/ 板卡上（GDDR）</td><td>~400-600 cycle</td><td>全局</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      注意 <strong>HBM 是堆叠在封装里的</strong>，位宽可以做到 4096 bit 甚至更宽，
+      这是它带宽远高于 DDR 的根本原因。带宽 = 位宽 × 频率，位宽是硬件决定的。
+    </p>
+
+    <h2 id="stack">软件栈分层</h2>
+    <p>这是最关键的一节。把所有东西按层摆清楚：</p>
+    <pre><code>┌─────────────────────────────────────────┐
+│  应用：PyTorch / TensorFlow / 自定义程序    │
+├─────────────────────────────────────────┤
+│  运行时：CUDA Runtime (libcudart)         │  ← cudaMalloc / cudaMemcpy / &lt;&lt;&lt;&gt;&gt;&gt;
+├─────────────────────────────────────────┤
+│  驱动 API：CUDA Driver (libcuda)          │  ← cuCtxCreate / cuLaunchKernel
+├─────────────────────────────────────────┤
+│  用户态驱动 UMD：CUDA UMD                  │  ← 编译成 GPU ISA、填命令缓冲区
+├─────────────────────────────────────────┤
+│  内核态驱动 KMD：nvidia.ko                 │  ← 分配显存、中断、上下文切换
+├─────────────────────────────────────────┤
+│  硬件：GPU / GSP 固件 / 命令处理器           │
+└─────────────────────────────────────────┘</code></pre>
+    <p>
+      严格的边界是 <strong>UMD / KMD</strong>：UMD 在用户态，能直接读写映射进来的显存和
+      命令缓冲区（MMIO 或 BAR 映射），所以<strong>提交一个 kernel 的常规路径不需要系统调用</strong>；
+      KMD 只在需要内核权限时介入 —— 分配新显存、建立地址映射、处理缺页、切换上下文。
+    </p>
+
+    <h3 id="api-levels">Runtime API vs Driver API</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>维度</th><th>Runtime API（libcudart）</th><th>Driver API（libcuda）</th></tr></thead>
+        <tbody>
+          <tr><td>前缀</td><td><code>cuda*</code>（cudaMalloc）</td><td><code>cu*</code>（cuMemAlloc）</td></tr>
+          <tr><td>上下文</td><td>隐式管理，第一次调用自动创建</td><td>显式 <code>cuCtxCreate</code></td></tr>
+          <tr><td>模块</td><td>隐式加载，<code>&lt;&lt;&lt;&gt;&gt;&gt;</code> 语法</td><td>显式 <code>cuModuleLoad</code> + <code>cuLaunchKernel</code></td></tr>
+          <tr><td>依赖</td><td>依赖 cudart 库</td><td>只依赖驱动</td></tr>
+          <tr><td>适用</td><td>绝大多数应用</td><td>需要细粒度控制、多上下文、语言运行时</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Runtime API 是 Driver API 的一层封装。比如 <code>cudaMalloc</code> 背后是
+      <code>cuMemAlloc</code>，加上隐式上下文管理和错误检查。
+      深度学习框架（PyTorch）最终走的都是 Driver API。
+    </p>
+
+    <h3 id="umd-kmd">UMD / KMD 分工（重点）</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>职责</th><th>UMD（用户态）</th><th>KMD（内核态）</th></tr></thead>
+        <tbody>
+          <tr><td>命令提交</td><td>填充命令缓冲区（ring buffer）</td><td>建立 ring buffer 内存映射</td></tr>
+          <tr><td>显存分配</td><td>从已有池子分配</td><td>向 GPU 申请、建立 GPU 页表</td></tr>
+          <tr><td>上下文</td><td>管理用户态状态</td><td>保存/恢复硬件上下文、时间片调度</td></tr>
+          <tr><td>缺页</td><td>无</td><td>处理 GPU 缺页、迁移内存</td></tr>
+          <tr><td>中断</td><td>无</td><td>接收、分发、唤醒等待者</td></tr>
+          <tr><td>同步</td><td>用户态自旋（高效路径）</td><td>阻塞等待、信号量</td></tr>
+          <tr><td>隔离</td><td>无（同一进程内）</td><td>进程间隔离、权限校验</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="box ok">
+      <span class="box-title">面试可以主动讲这个</span>
+      可以这样答："UMD 层典型的路径是用户态直接填命令队列，
+      通过 doorbell 寄存器通知硬件，只有创建上下文、分配新显存、处理异常这类
+      需要内核权限的操作才走 ioctl。" —— 这一句话就证明你懂 <strong>为什么 GPU 驱动要分两层</strong>。
+    </div>
+
+    <h2 id="context">上下文、模块与流</h2>
+
+    <h3 id="ctx">CUDA Context</h3>
+    <p>
+      一个 CPU 进程对应至少一个 CUDA context，context 是<strong>所有 GPU 资源的容器</strong>：
+      显存分配、模块、流、事件都挂在某个 context 下。切换 context 是<strong>重量级</strong>操作 ——
+      需要保存/恢复整个 GPU 状态（寄存器、页表基址、缓存），成本在几十微秒到毫秒。
+    </p>
+    <p>两个特殊上下文：</p>
+    <ul>
+      <li><strong>Primary context</strong>：每个设备每个进程一个，Runtime API 默认用这个。</li>
+      <li><strong>Custom context</strong>：用 Driver API 显式创建，可以有多个，用于精细控制。</li>
+    </ul>
+    <div class="box warn">
+      <span class="box-title">context 切换为什么贵</span>
+      因为 GPU 是"整卡"资源。不同 context 有不同的虚拟地址空间、不同的页表，
+      切换时要把 TLB 刷掉、把硬件状态存到显存、把新状态加载回来。
+      这也是为什么多进程共享 GPU 效率低、MPS 和 MIG 存在的意义。
+    </div>
+
+    <h3 id="stream">Stream 与执行顺序</h3>
+    <p>
+      一个 stream 是一个<strong>有序队列</strong>：submit 到同一个 stream 的操作严格按顺序执行；
+      不同 stream 之间<strong>没有顺序保证</strong>，可以并发（如果资源允许）。
+    </p>
+    <pre><code>cudaStream_t s1, s2;
+cudaStreamCreate(&amp;s1);
+cudaStreamCreate(&amp;s2);
+
+kernelA&lt;&lt;&lt;grid, block, 0, s1&gt;&gt;&gt;();   <span class="c">// 和 B 可以并发</span>
+kernelB&lt;&lt;&lt;grid, block, 0, s2&gt;&gt;&gt;();
+kernelC&lt;&lt;&lt;grid, block, 0, s1&gt;&gt;&gt;();   <span class="c">// 一定在 A 之后</span>
+
+cudaDeviceSynchronize();              <span class="c">// 等所有 stream</span></code></pre>
+    <p>
+      <strong>默认流（legacy default stream）</strong>很特殊：它会和所有其他 stream 同步 ——
+      也就是说 legacy default stream 里的操作会等所有 stream 完成，也会阻塞所有 stream。
+      这常常是性能杀手。所以有了 <code>--default-stream per-thread</code> 编译选项和
+      <code>cudaStreamNonBlocking</code>。
+    </p>
+
+    <h3 id="event">Event 与同步</h3>
+    <p>
+      Event 是<strong>轻量级的同步点</strong>，插在 stream 里，可以：
+    </p>
+    <ul>
+      <li><code>cudaEventRecord</code>：在 stream 当前位置打一个标记。</li>
+      <li><code>cudaEventSynchronize</code>：CPU 阻塞等这个标记被 GPU 处理完。</li>
+      <li><code>cudaStreamWaitEvent</code>：让另一个 stream 等这个 event（跨 stream 同步，不需要 CPU 介入）。</li>
+      <li><code>cudaEventElapsedTime</code>：测量两个 event 之间的 GPU 时间。</li>
+    </ul>
+    <pre><code><span class="c">// 跨 stream 同步的典型用法：s2 等 s1 完成</span>
+cudaEventRecord(ev, s1);
+cudaStreamWaitEvent(s2, ev, 0);
+<span class="c">// 现在 s2 中后续操作一定在 s1 的 ev 之前所有操作之后</span></code></pre>
+
+    <h3 id="graphs">CUDA Graphs</h3>
+    <p>
+      NVIDIA 的 Principal JD 里明确提到了 CUDA Graphs。它的动机是：
+      <strong>launch 开销</strong>。每次 <code>&lt;&lt;&lt;&gt;&gt;&gt;</code> 都要走一遍运行时 → 驱动 → 硬件，
+      小 kernel 密集的场景，launch 开销能占到总时间的 50% 以上。
+    </p>
+    <p>
+      CUDA Graph 把一串操作<strong>录制成图</strong>，之后一次性提交整个图，硬件按依赖关系调度，
+      把 N 次 launch 合并成 1 次。对于推理这类固定的计算图，收益非常明显。
+    </p>
+    <pre><code><span class="c">// 1. 录制</span>
+cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+launchA(); launchB(); launchC();
+cudaStreamEndCapture(stream, &amp;graph);
+
+<span class="c">// 2. 实例化（只做一次）</span>
+cudaGraphInstantiate(&amp;exec, graph, NULL, NULL, 0);
+
+<span class="c">// 3. 每次循环只需一次 launch</span>
+<span class="k">for</span> (<span class="k">int</span> i = 0; i &lt; N; i++)
+    cudaGraphLaunch(exec, stream);</code></pre>
+    <div class="box">
+      <span class="box-title">Graph 在驱动层是怎么实现的</span>
+      图被上传到 GPU 一次，硬件里有专门的图调度器，节点之间的依赖由硬件解析、
+      不需要 CPU 逐个 launch。这也是为什么它能把 launch 开销从微秒降到纳秒级。
+      面试如果问"CUDA Graphs 为什么快"，答案就是<strong>把 CPU 侧的重复工作搬到了硬件侧</strong>。
+    </div>
+
+    <h2 id="memory">显存管理与统一内存</h2>
+
+    <h3 id="alloc">分配方式</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>API</th><th>说明</th><th>特点</th></tr></thead>
+        <tbody>
+          <tr><td><code>cudaMalloc</code></td><td>常规分配</td><td>同步，慢，会阻塞</td></tr>
+          <tr><td><code>cudaMallocAsync</code></td><td>流序分配器（11.2+）</td><td>异步，基于内存池，避免全局同步</td></tr>
+          <tr><td><code>cudaMallocManaged</code></td><td>统一内存</td><td>CPU/GPU 都能直接访问，自动迁移</td></tr>
+          <tr><td><code>cudaHostAlloc</code></td><td>锁页主机内存（pinned）</td><td>DMA 必需，不能换出</td></tr>
+          <tr><td><code>cudaMemcpyAsync</code></td><td>异步拷贝</td><td>配合 stream 和 pinned 内存才能真异步</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="box danger">
+      <span class="box-title">最常见的性能 bug</span>
+      <code>cudaMemcpy</code> 用普通 <code>malloc</code> 的内存，驱动必须先把数据拷到内部 pinned buffer，
+      再 DMA 到 GPU —— <strong>变成同步的、双倍拷贝</strong>。
+      正确做法：<code>cudaHostAlloc</code> 分配 pinned 内存 + <code>cudaMemcpyAsync</code> + stream。
+      这是"为什么我的异步不异步"的标准答案。
+    </div>
+
+    <h3 id="um">Unified Memory 与 HMM</h3>
+    <p>
+      统一内存的目标是<strong>让程序员不用手动 memcpy</strong>。CPU 和 GPU 共享同一个虚拟地址，
+      物理页可以在两边迁移。实现上依赖 <strong>GPU 缺页机制</strong>：
+    </p>
+    <ol>
+      <li>GPU 访问一个不在显存里的页 → 触发 GPU 缺页异常。</li>
+      <li>KMD 处理异常，找到对应的主机内存页。</li>
+      <li>把页迁移到显存（或者建立映射，如果硬件支持直接访问主机内存）。</li>
+      <li>更新 GPU 页表，恢复执行。</li>
+    </ol>
+    <p>
+      Linux 上的 <strong>HMM（Heterogeneous Memory Management）</strong>是把这个能力做进内核主体：
+      用 <code>migrate_vma</code> 系列接口让设备驱动能安全地迁移进程的匿名页，
+      用 <code>mmu_interval_notifier</code> 在 CPU 侧页表变化时通知设备驱动。
+      NVIDIA 的 <code>nvidia.ko</code> 就是这么接的。
+    </p>
+    <div class="box warn">
+      <span class="box-title">统一内存的代价</span>
+      第一次访问一个页会触发缺页，延迟是毫秒级。如果页在 CPU 和 GPU 之间反复迁移
+      （thrashing），性能会比手动拷贝差得多。
+      所以有 <code>cudaMemAdvise</code> 告诉驱动"这个页固定放哪"、
+      <code>cudaMemPrefetchAsync</code> 主动预热。
+    </div>
+
+    <h3 id="gpu-page-table">GPU 页表与地址翻译</h3>
+    <p>
+      GPU 有自己的 MMU，自己的页表。<code>cudaMalloc</code> 返回的地址是<strong>GPU 虚拟地址</strong>，
+      和 CPU 虚拟地址是两套。驱动负责建立映射。
+    </p>
+    <p>
+      在虚拟化里更复杂：guest 的 GPU 虚拟地址 → guest 的 GPU 物理地址 → host 的物理地址，
+      需要 GPU 侧的 IOMMU（如 NVIDIA 的 ATS / SMMU）来做第二级翻译。
+      这是 vGPU 和 GPU 直通的核心难点。
+    </p>
+
+    <h2 id="submit">命令提交与调度</h2>
+
+    <h3 id="ring">Ring Buffer 模型</h3>
+    <p>
+      GPU 驱动的通用模型：用户态在<strong>环形缓冲区</strong>里填命令（command buffer / pushbuffer），
+      然后更新 <code>tail</code> 指针（写 doorbell 寄存器），硬件从 <code>head</code> 开始消费。
+    </p>
+    <pre><code><span class="c">// 用户态填充，只有最后写 doorbell 才涉及硬件</span>
+cmd = ring-&gt;buf + ring-&gt;tail % ring-&gt;size;
+cmd-&gt;op    = CMD_DISPATCH;
+cmd-&gt;addr  = kernel_gpu_addr;
+cmd-&gt;grid  = dim3(64, 1, 1);
+cmd-&gt;block = dim3(256, 1, 1);
+ring-&gt;tail++;
+
+<span class="c">/* 内存屏障，确保命令写完 */</span>
+wmb();
+<span class="c">/* 通知硬件：写 doorbell */</span>
+*ring-&gt;doorbell = ring-&gt;tail;</code></pre>
+    <p>
+      这套模型的优点是：<strong>常规提交路径没有系统调用</strong>，用户态直接写内存和 MMIO，
+      延迟极低（几十纳秒）。代价是没有隔离 —— 密码就在 UMD 里，所以 UMD 的 bug 就是安全漏洞。
+    </p>
+
+    <h3 id="gpu-sched">GPU 侧调度</h3>
+    <p>
+      提交上去的 kernel 不会立刻执行，而是进到 GPU 的调度器里排队。
+      不同厂商的实现不同：
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>厂商</th><th>调度部件</th><th>特点</th></tr></thead>
+        <tbody>
+          <tr><td>NVIDIA</td><td>GigaThread Engine + 硬件调度器</td><td>负责把 block 分发到各个 SM</td></tr>
+          <tr><td>AMD</td><td>MEC / MES（Micro Engine Scheduler）</td><td>固件实现的调度器，无需 CPU 参与</td></tr>
+          <tr><td>Qualcomm</td><td>Ringbuffer + 固件 dispatch</td><td>移动端更轻量</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      重点理解：<strong>CPU 提交和 GPU 执行是异步的、解耦的</strong>。
+      CPU 提交 100 个 kernel 可能只用 100 微秒，GPU 执行要 100 毫秒。
+      这也是为什么需要一个足够深的硬件队列 —— 队列浅了，CPU 会饿死 GPU。
+    </p>
+    <p>
+      调度策略涉及：<strong>时间片</strong>（多个 context 抢同一张卡时）、
+      <strong>优先级</strong>（stream 优先级）、<strong>抢占</strong>（现代 GPU 支持指令级抢占，
+      但代价高，通常只在 kernel 边界抢占）。
+    </p>
+
+    <h2 id="sync">同步与内存一致性</h2>
+
+    <h3 id="host-device-sync">主机与设备的同步</h3>
+    <ul>
+      <li><code>cudaDeviceSynchronize()</code>：等所有 stream，最重。</li>
+      <li><code>cudaStreamSynchronize(s)</code>：等一个 stream。</li>
+      <li><code>cudaEventSynchronize(e)</code>：等一个 event，最轻。</li>
+      <li><code>cudaStreamQuery(s)</code>：非阻塞查询，返回 <code>cudaSuccess</code> 或 <code>cudaErrorNotReady</code>。</li>
+    </ul>
+    <div class="box danger">
+      <span class="box-title">隐式同步是性能杀手</span>
+      很多 API 会隐式 <code>cudaDeviceSynchronize</code>：
+      <code>cudaMalloc</code>（旧版）、<code>cudaMemcpy</code>（同步版）、
+      <code>cudaFree</code>、以及访问 host 侧的 <code>cudaMemcpy</code> 结果。
+      在 profile 里看到 "GPU 有空隙"，先查是不是有隐式同步。
+    </div>
+
+    <h3 id="memory-model">CUDA 内存模型与一致性</h3>
+    <p>
+      JD 里两次提到 "memory coherence and consistency models"。
+      CUDA 的内存模型比 C++ 弱，需要显式 Fence：
+    </p>
+    <ul>
+      <li><code>__syncthreads()</code>：block 内所有线程到达屏障，且能看到彼此在 shared memory 的写。这是 <strong>block 级</strong>。</li>
+      <li><code>__threadfence()</code>：当前线程的所有写在 device 范围内可见之前，后续访问不会重排。这是 <strong>device 级</strong>。</li>
+      <li><code>__threadfence_system()</code>：扩展到 host 可见。</li>
+      <li>原子操作：<code>atomicAdd</code> 等，默认 device 范围，<code>_system</code> 后缀扩展到 host。</li>
+    </ul>
+    <p>
+      在 Volta 之后，CUDA 引入了更细粒度的 <strong>acquire/release 语义</strong>
+      （<code>cuda::atomic</code>、<code>cuda::std::atomic</code>），和 C++11 内存模型对齐。
+      老代码靠 <code>volatile</code> + <code>__threadfence</code>，新代码推荐用 <code>cuda::atomic</code>。
+    </p>
+    <div class="box">
+      <span class="box-title">一个经典问题</span>
+      "为什么 GPU 上不能直接用 C++ 的 <code>std::atomic</code>？"
+      答：因为 GPU 线程模型和 CPU 不同 —— 没有抢占式调度、warp 内线程同步执行、
+      memory scope 分 block/device/system 三级。CUDA 提供了带 scope 参数的原子操作，
+      语义更精确，性能也更好。
+    </div>
+
+    <h3 id="pcie-order">PCIe 与主机侧的可见性</h3>
+    <p>
+      PCIe 是<strong>posted write</strong>：写操作先进入发送队列，CPU 不等确认就继续。
+      所以写完一个数据后，要让 GPU 看到，需要：
+    </p>
+    <ol>
+      <li>保证数据已经离开 CPU 的写缓冲（<code>sfence</code> 或 <code>wmb()</code>）。</li>
+      <li>保证 PCIe 事务已经被 GPU 收到（可能需要读回一个寄存器做 flush）。</li>
+    </ol>
+    <p>
+      这就是为什么 <code>cudaMemcpyAsync</code> + pinned memory 才能真异步 ——
+      驱动知道这块内存不能被换出、地址稳定，可以直接 DMA。
+    </p>
+
+    <h2 id="multi">多进程、多卡与拓扑</h2>
+
+    <h3 id="mps">MPS（Multi-Process Service）</h3>
+    <p>
+      默认情况下，多个进程不能同时用同一张卡（context 切换开销大）。
+      MPS 让多个进程<strong>共享同一个 context</strong>，由 MPS server 统一提交，
+      避免 context 切换，也允许多个进程的 kernel 并发执行。
+    </p>
+    <p>限制：MPS 下没有进程间隔离（一个进程崩溃可能影响其他），共享同一个显存池。</p>
+
+    <h3 id="mig">MIG（Multi-Instance GPU）</h3>
+    <p>
+      A100 之后引入。把一张物理 GPU <strong>硬切成多个独立实例</strong>，
+      每个实例有自己的 SM、显存、L2 slice、带宽。这是硬件级隔离，
+      每个实例就像一个独立的小 GPU。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>MPS</th><th>MIG</th></tr></thead>
+        <tbody>
+          <tr><td>隔离级别</td><td>软件（共享 context）</td><td>硬件（独立 SM/显存）</td></tr>
+          <tr><td>故障隔离</td><td>无</td><td>有</td></tr>
+          <tr><td>显存</td><td>共享，可超分</td><td>物理切分</td></tr>
+          <tr><td>适用</td><td>多用户共享、小任务</td><td>多租户、云服务</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 id="topology">NVLink 与拓扑</h3>
+    <p>
+      多卡之间通信走 PCIe 还是 NVLink，带宽差一个数量级：
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>互连</th><th>带宽（单向）</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>PCIe 4.0 x16</td><td>~32 GB/s</td><td>通用</td></tr>
+          <tr><td>PCIe 5.0 x16</td><td>~64 GB/s</td><td>新平台</td></tr>
+          <tr><td>NVLink 3（A100）</td><td>~300 GB/s</td><td>专用，卡间直连</td></tr>
+          <tr><td>NVLink 4（H100）</td><td>~450 GB/s</td><td>配合 NVSwitch 全互联</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <code>nvidia-smi topo -m</code> 能看到拓扑矩阵：<code>NV#</code> 表示走 NVLink，
+      <code>PIX/PXB</code> 表示同一个 PCIe switch，<code>SYS</code> 表示跨 NUMA 节点。
+      分布式训练时要让通信量大的 rank 走 NVLink 或同一 switch。
+    </p>
+
+    <h2 id="qa">高频问答</h2>
+
+    <details class="qa">
+      <summary>为什么 GPU 驱动要分用户态和内核态两层？</summary>
+      <div class="a">
+        <p><strong>性能</strong>：命令提交如果每次都走系统调用，开销太大。UMD 直接写映射进用户态的
+        命令缓冲区，一次 launch 只需几十纳秒；如果走 ioctl，每次至少几微秒。</p>
+        <p><strong>安全</strong>：真正的危险操作 —— 分配显存、改页表、访问硬件寄存器 —— 必须有内核把关，
+        否则一个用户进程就能破坏其他进程甚至整机。</p>
+        <p><strong>抽象</strong>：KMD 提供最小可用的能力（<code>alloc</code>、<code>map</code>、<code>submit</code>、<code>wait</code>），
+        UMD 在此之上实现完整的 API（CUDA / Vulkan / OpenCL）。同一个 KMD 可以支撑多个 API。</p>
+        <p>这就是 DRM 的子系统的设计哲学，也是 NVIDIA 从闭源 <code>nvidia.ko</code> 分出一个
+        很小的 <code>nvidia-drm.ko</code> 接进标准 DRM 框架的原因。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>一次 kernel launch 从 API 调用到硬件执行，经历了什么？</summary>
+      <div class="a">
+        <ol>
+          <li><code>kernel&lt;&lt;&lt;&gt;&gt;&gt;()</code> → Runtime 检查上下文、参数、错误。</li>
+          <li>Runtime 把参数打包成驱动期望的格式，调用 Driver API（<code>cuLaunchKernel</code>）。</li>
+          <li>UMD 把命令写进命令缓冲区，写入 kernel 的 GPU 虚拟地址、grid/block 维度、参数地址。</li>
+          <li>UMD 更新 ring buffer 的 tail，写 doorbell 寄存器通知硬件。</li>
+          <li>GPU 的 front-end 解析命令，把 block 分发到 SM（GigaThread Engine）。</li>
+          <li>SM 里的 warp scheduler 依次发射线程执行。</li>
+          <li>执行完，GPU 写完成信号，触发中断（或被 poll 到），KMD 唤醒等待者。</li>
+        </ol>
+        <p><strong>追问</strong>：如果 kernel 参数很大（超过 4KB），怎么办？驱动会把它放到一个特殊的 constant bank，
+        或者从显存里的一个 buffer 读，而不是塞进命令缓冲区。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>cudaMalloc 为什么慢？怎么优化？</summary>
+      <div class="a">
+        <p><code>cudaMalloc</code> 慢的原因：① 它是同步的，会等待所有正在进行的操作完成；
+        ② 每次都要向 KMD 请求新的显存、建立 GPU 页表项；③ 可能有碎片整理。</p>
+        <p>优化：</p>
+        <ul>
+          <li><strong>内存池</strong>：一次大块分配，自己管理。PyTorch 的 caching allocator 就是这个思路。</li>
+          <li><code>cudaMallocAsync</code>：流序分配器，基于内存池，异步，不会全局同步。</li>
+          <li>避免在热路径里分配/释放，预分配 + 复用。</li>
+        </ul>
+        <p>面试常追问：PyTorch 的显存碎片是怎么产生的？因为不同大小的 tensor 交错分配释放，
+        大块空闲但被小 tensor 占用而无法合并。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Stream 和 Event 的关系？如何实现跨 stream 同步？</summary>
+      <div class="a">
+        <p>Stream 是<strong>执行队列</strong>，Event 是<strong>队列中的标记</strong>。</p>
+        <p>跨 stream 同步：<code>cudaEventRecord(ev, s1)</code> 在 s1 中打点，
+        <code>cudaStreamWaitEvent(s2, ev, 0)</code> 让 s2 等待。整个过程<strong>不需要 CPU 介入</strong>，
+        是 GPU 侧的同步。</p>
+        <p>对比：<code>cudaStreamSynchronize</code> 是 CPU 等待，会让 CPU 阻塞；
+        Event 可以在不阻塞 CPU 的情况下建立依赖。</p>
+        <p>典型场景：多 stream 流水线 —— s1 做数据预处理，s2 做计算，
+        用 event 让 s2 等 s1 的每一批数据，实现流水并行。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>统一内存（Unified Memory）的优缺点？什么场景不该用？</summary>
+      <div class="a">
+        <p><strong>优点</strong>：编程简单，不用手动 memcpy；支持超分配（申请超过显存的量）；
+        支持 GPU 直接访问主机内存（zero-copy）。</p>
+        <p><strong>缺点</strong>：</p>
+        <ul>
+          <li>首次访问缺页，延迟高。</li>
+          <li>页迁移开销大，thrashing 时性能极差。</li>
+          <li>实现依赖 GPU 硬件支持（页错误处理），老的 GPU 不支持精细粒度。</li>
+        </ul>
+        <p><strong>不该用的场景</strong>：数据量固定且能预知、追求极致性能的训练场景 ——
+        手动 <code>cudaMemcpyAsync</code> + pinned memory 更快更可控。
+        统一内存更适合<strong>数据量动态、开发效率优先</strong>的场景，比如原型开发和某些推理场景。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>GPU 缺页异常和 CPU 缺页异常有什么区别？</summary>
+      <div class="a">
+        <p><strong>CPU</strong>：页错误由 MMU 触发，内核的 <code>do_page_fault</code> 处理，
+        进程被挂起，处理完恢复。</p>
+        <p><strong>GPU</strong>：页错误由 GPU 的 MMU 触发，通过中断通知 KMD，
+        KMD 查页表、找对应主机页、迁移到显存、更新 GPU 页表，然后恢复 GPU 执行。</p>
+        <p>难点：① GPU 有大量并发线程，一个缺页可能阻塞整个 warp；
+        ② 缺页处理涉及 GPU 和 CPU 两个页表，要保证一致性；
+        ③ 在虚拟化环境下还有第三层翻译。</p>
+        <p>NVIDIA 的 <code>HMM</code> + <code>mmu_interval_notifier</code> 就是解决这个问题的
+        内核机制：当 CPU 侧页表变化（比如页被换出），通知 GPU 驱动，驱动再更新 GPU 侧映射。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>多个进程想同时用一张 GPU，有哪些方案？</summary>
+      <div class="a">
+        <table style="margin:8px 0">
+          <tr><th>方案</th><th>原理</th><th>隔离</th><th>性能</th></tr>
+          <tr><td>串行（默认）</td><td>时间片轮转 context</td><td>强</td><td>差（切换开销）</td></tr>
+          <tr><td>MPS</td><td>共享 context，统一提交</td><td>无</td><td>好</td></tr>
+          <tr><td>MIG</td><td>硬件切分</td><td>强</td><td>接近原生</td></tr>
+          <tr><td>vGPU</td><td>虚拟化环境，软件模拟</td><td>强</td><td>中等</td></tr>
+          <tr><td>SR-IOV</td><td>虚拟化硬件直通</td><td>强</td><td>接近原生</td></tr>
+        </table>
+        <p>选择依据：要不要隔离？要不要弹性？能不能接受性能损失？</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>讲讲你遇到过的最复杂的驱动问题</summary>
+      <div class="a">
+        <p>这是 STAR 题，但驱动岗有特定的<strong>加分点</strong>：</p>
+        <ul>
+          <li><strong>强调时序问题</strong>：不是逻辑错，是并发下的竞态。比如"多线程同时提交，命令缓冲区指针错乱"。</li>
+          <li><strong>强调定位手段</strong>：怎么发现的？用什么工具？dmesg、ftrace、硬件计数器、还是自己加 trace？</li>
+          <li><strong>强调验证</strong>：修完怎么证明修对了？跑了多少轮压力测试？有没有用 KCSAN / TSAN？</li>
+          <li><strong>强调影响</strong>：这个问题影响了什么？修完提升了多少？</li>
+        </ul>
+        <p>不要讲"我实现了 XX 功能"，要讲"我定位并解决了一个 XX 问题"——
+        资深岗看的是<strong>解决未知问题的能力</strong>，不是执行已知需求的能力。</p>
+      </div>
+    </details>
+
+    <div class="box ok" style="margin-top:34px">
+      <span class="box-title">下一步</span>
+      去 <a href="../quiz/index.html?cat=gpu">刷 GPU 专题</a>。
+      然后读 <a href="virt.html">虚拟化</a> —— GPU 虚拟化是把这一页的知识和内核知识
+      结合在一起的地方，也是 JD 里明确要求的方向。
+    </div>
+  </main>
+</div>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

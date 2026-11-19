@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>虚拟化与隔离 · 面试准备</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="virt">
+<div id="topbar" data-base="../"></div>
+<div style="position:sticky;top:56px;z-index:49;height:3px;background:transparent"><i id="read-bar" style="display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--purple))"></i></div>
+
+<div class="wrap">
+<div class="layout">
+  <aside class="sidebar"><div id="toc"></div></aside>
+
+  <main class="content">
+    <h1>虚拟化与隔离</h1>
+    <p style="color:var(--text-dim);font-size:15.5px">
+      只回答三件事：<strong>怎么截获、怎么翻译、切分的代价是多少</strong>。
+      CPU、内存、IO 各有一套机制，GPU 是 IO 里最难的一类。
+    </p>
+
+    <div class="box warn">
+      <span class="box-title">本页边界</span>
+      不涉及算子与 GPU 微架构优化。只谈 hypervisor / 驱动视角：
+      VM exit 的触发与开销、EPT 翻译路径、VFIO 与 IOMMU、virtqueue、
+      SR-IOV 的 PF/VF 职责、vGPU 与 SR-IOV 的隔离边界。
+    </div>
+
+    <h2 id="numbers">关键数字与术语</h2>
+
+    <h3 id="numbers-terms">术语表（能对答如流）</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>术语</th><th>全称</th><th>一句话作用</th><th>对应物</th></tr></thead>
+        <tbody>
+          <tr><td><strong>VT-x</strong></td><td>Intel Virtualization Technology for x86</td><td>引入 root / non-root 两种执行模式</td><td>AMD-V（SVM）</td></tr>
+          <tr><td><strong>root mode</strong></td><td>VMX root operation</td><td>hypervisor 运行的模式，俗称 ring -1</td><td>—</td></tr>
+          <tr><td><strong>VMCS</strong></td><td>Virtual Machine Control Structure</td><td>每个 vCPU 一块控制区，存 guest/host 状态与退出原因</td><td>VMCB</td></tr>
+          <tr><td><strong>VM entry / exit</strong></td><td>—</td><td>root 与非 root 之间的硬件切换</td><td>—</td></tr>
+          <tr><td><strong>EPT</strong></td><td>Extended Page Tables</td><td>硬件完成 GPA → HPA 的第二级翻译</td><td>NPT / ARM stage-2</td></tr>
+          <tr><td><strong>IOMMU</strong></td><td>I/O Memory Management Unit</td><td>设备 DMA 的地址翻译与访问隔离</td><td>VT-d / AMD-Vi / SMMU</td></tr>
+          <tr><td><strong>IOVA</strong></td><td>I/O Virtual Address</td><td>设备发出的地址，经 IOMMU 译为 HPA</td><td>—</td></tr>
+          <tr><td><strong>VFIO</strong></td><td>Virtual Function I/O</td><td>把设备安全交给用户态或 guest 的内核框架</td><td>—</td></tr>
+          <tr><td><strong>SR-IOV</strong></td><td>Single Root I/O Virtualization</td><td>一个 PCIe 设备硬件切分为多个功能</td><td>—</td></tr>
+          <tr><td><strong>PF / VF</strong></td><td>Physical / Virtual Function</td><td>PF 管配置与生命周期，VF 是分出去的轻量功能</td><td>—</td></tr>
+          <tr><td><strong>MIG</strong></td><td>Multi-Instance GPU</td><td>GPU 内部按 SM / L2 / 显存控制器硬件分区</td><td>—</td></tr>
+          <tr><td><strong>vGPU</strong></td><td>virtual GPU</td><td>hypervisor 层时间片共享一块物理 GPU</td><td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>追问：</strong>「VT-x 的 VMCS 和 AMD 的 VMCB 有什么区别？」——概念一一对应；差异在字段布局和是否允许软件直接读写（VMCS 通过 VMREAD/VMWRITE，VMCB 是普通内存，可 mmap 访问）。</p>
+
+    <h3 id="numbers-facts">必须准确的数字</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>数字</th><th>准确说法</th></tr></thead>
+        <tbody>
+          <tr><td>VM exit 开销</td><td><strong>千级 cycles</strong>，比系统调用（百 cycle 级）高一个数量级；具体随微架构、exit reason、是否刷 TLB 差异很大，不要记成固定值</td></tr>
+          <tr><td>VMCS 对齐</td><td>区域必须 <strong>4KB 对齐</strong>；<strong>大小不是固定 4KB</strong>，由 <code>IA32_VMX_BASIC[44:32]</code> 报告，编程时按报告值分配</td></tr>
+          <tr><td>VMCS 归属</td><td><strong>每个 vCPU 一块</strong>（准确说是每个逻辑 CPU 有一个 current VMCS），不是每个 VM 一块</td></tr>
+          <tr><td>PCIe 配置空间</td><td>PCI 兼容配置空间 <strong>256 字节</strong>（Type 0 header 占 64 字节）；PCIe extended config space 共 <strong>4KB</strong>，SR-IOV Capability 在扩展区</td></tr>
+          <tr><td>x86-64 页表</td><td>4 级页表；<strong>虚拟地址 48 位、物理地址最多 52 位</strong>（4 级 paging 下）</td></tr>
+          <tr><td>MIG 切片数</td><td>切片数由 GPC 数量决定，<strong>A100 为 7 个</strong>；不同型号不同，以官方文档为准</td></tr>
+          <tr><td>NVIDIA SR-IOV</td><td>Ampere 起支持；VF 数由设备能力决定，<strong>远少于网卡</strong>，不要背具体上限</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>追问：</strong>「VMCS 为什么要求 4KB 对齐？」——这是 VMX 架构的规定（VMCS 区域按页对齐，便于硬件用页粒度做保护和隔离）；同时 VMCS 里含有指向其他结构的指针，对齐也方便地址计算。</p>
+
+    <h2 id="cpu">CPU 虚拟化</h2>
+
+    <h3 id="cpu-sensitive">敏感指令与 trap-and-emulate</h3>
+    <p>
+      要能虚拟化，必须满足：<strong>敏感指令 ⊆ 特权指令</strong>。也就是「会暴露或改变硬件状态的指令」都要能 trap。
+      x86 早期不满足，反例是 <code>popf</code>：在不够特权级时执行它<strong>既不会 #GP，也不修改 IF</strong>，
+      而是静默地部分生效 —— 这类指令叫「非特权但敏感」，抓不到又跑不对。
+    </p>
+    <p>
+      早期解法是二进制翻译（BT）：扫描 guest 代码，把敏感指令替换成跳转。
+      现代硬件把这一步交给 CPU：guest 跑在 non-root，执行敏感指令时硬件自动 VM exit，
+      hypervisor 读退出原因、模拟、再 VM entry 回去。整个过程对 guest 不可见。
+    </p>
+    <p><strong>追问：</strong>「有硬件辅助了，半虚拟化还有必要吗？」——有。CPU 状态可以靠硬件截获，但设备访问如果每个寄存器都 exit 仍然昂贵，所以在设备层继续用半虚拟化接口（virtio）。</p>
+
+    <h3 id="cpu-modes">三条路线</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>路线</th><th>做法</th><th>要改 guest 吗</th><th>代价</th></tr></thead>
+        <tbody>
+          <tr><td>全虚拟化（BT）</td><td>运行时翻译敏感指令</td><td>不改</td><td>翻译开销大，已基本被淘汰</td></tr>
+          <tr><td>半虚拟化（paravirt）</td><td>guest 主动发 hypercall</td><td><strong>要改内核</strong></td><td>路径短，但绑定 hypervisor</td></tr>
+          <tr><td>硬件辅助</td><td>VT-x / SVM 提供模式与 VMCS</td><td>不改</td><td>exit 仍贵，但可控</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>现实系统是混合的：<strong>CPU 用硬件辅助，设备用 virtio</strong>。这也是 KVM 的标准形态。</p>
+    <p><strong>追问：</strong>「paravirt 和 virtio 的思想有什么共同点？」——都让 guest <strong>知道自己被虚拟化</strong>，用批量接口代替逐次 trap；区别是 virtio 是设备层标准，不需要改 CPU 相关代码。</p>
+
+    <h3 id="cpu-vmcs">VMCS 里有什么、exit 为什么贵</h3>
+    <ul>
+      <li><strong>Guest-state</strong>：通用寄存器、RIP/RSP、CR0/CR3/CR4、段寄存器、MSR、活动状态。</li>
+      <li><strong>Host-state</strong>：hypervisor 自己的对应状态，exit 时硬件自动加载。</li>
+      <li><strong>VM-execution control</strong>：哪些事件触发 exit（MSR bitmap、I/O bitmap、EPTP、异常 bitmap、中断是否 exit）。</li>
+      <li><strong>VM-exit information</strong>：basic exit reason（16 位）、qualification、中断信息、指令长度。</li>
+    </ul>
+    <p>常见 exit 原因：<code>CPUID</code>、<code>HLT</code>、I/O 指令、MSR 读写、CR 访问、<code>VMCALL</code>、EPT violation、EPT misconfig、外部中断（若配置为 exit）、PAUSE（若开启）。</p>
+    <p>开销来源是复合的：硬件要保存/恢复上百个字段（<strong>VMCS 访存是内存操作</strong>）；可能刷 TLB 或破坏流水线；退出后走 hypervisor 的 C 路径（可能加锁、可能调度）；cache 被污染。所以优化方向永远是<strong>减少 exit 次数</strong>，而不是让 exit 更快。</p>
+    <p><strong>追问：</strong>「具体怎么减少 exit？」——EPT 消除页表写保护 trap；大页减少 EPT violation；MSR bitmap 放行无害 MSR；halt polling 处理空闲；posted interrupt / APICv 投递中断；virtio 批量提交设备请求。</p>
+
+    <h2 id="kvm">KVM 架构</h2>
+
+    <h3 id="kvm-layers">kvm.ko + QEMU 两层</h3>
+    <pre><code>┌────────────────────────────────────────────┐
+│ QEMU（用户态 VMM）                          │
+│  设备模拟 / 内存布局 / 迁移 / 每 vCPU 一线程  │
+├────────────────────────────────────────────┤
+│ /dev/kvm  ← ioctl                          │
+├────────────────────────────────────────────┤
+│ kvm.ko：VMX/SVM 的薄封装、EPT、中断注入       │
+├────────────────────────────────────────────┤
+│ Linux：调度器、内存管理、IOMMU、设备驱动       │
+├────────────────────────────────────────────┤
+│ 硬件：VT-x / SVM / EPT / VT-d               │
+└────────────────────────────────────────────┘</code></pre>
+    <p>KVM 本身<strong>不实现</strong>调度和内存管理，它把 Linux 内核变成 hypervisor：vCPU 用普通调度器调度，guest 内存就是 host 进程的地址空间。这是它与 Xen（自带调度器与内存管理）最本质的区别。</p>
+    <p><strong>追问：</strong>「这个设计带来什么限制？」——guest 看到的是 Linux 的调度与内存语义；实时性和确定性受宿主影响，所以低延迟场景要给 vCPU 绑核、配 cpuset、用 isolcpus。</p>
+
+    <h3 id="kvm-ioctl">/dev/kvm 的 ioctl</h3>
+    <pre><code><span class="k">int</span> kvm  = open(<span class="s">"/dev/kvm"</span>, O_RDWR);
+<span class="k">int</span> vm   = ioctl(kvm, KVM_CREATE_VM, <span class="n">0</span>);
+
+<span class="c">// guest 物理内存：GPA → host 进程虚拟地址</span>
+<span class="k">struct</span> kvm_userspace_memory_region r = {
+    .slot = <span class="n">0</span>, .guest_phys_addr = <span class="n">0</span>,
+    .memory_size = <span class="n">1UL</span> &lt;&lt; <span class="n">30</span>,
+    .userspace_addr = (<span class="k">unsigned long</span>)mem,
+};
+ioctl(vm, KVM_SET_USER_MEMORY_REGION, &amp;r);
+
+<span class="k">int</span> vcpu = ioctl(vm, KVM_CREATE_VCPU, <span class="n">0</span>);
+<span class="k">int</span> sz = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, <span class="n">0</span>);
+<span class="k">struct</span> kvm_run *run = mmap(<span class="n">0</span>, sz, PROT_READ|PROT_WRITE, MAP_SHARED, vcpu, <span class="n">0</span>);
+
+<span class="k">for</span> (;;) {
+    ioctl(vcpu, KVM_RUN, <span class="n">0</span>);          <span class="c">// 不返回 = guest 在跑</span>
+    <span class="k">switch</span> (run-&gt;exit_reason) {
+    <span class="k">case</span> KVM_EXIT_IO:       <span class="c">/* PIO */</span>
+    <span class="k">case</span> KVM_EXIT_MMIO:     <span class="c">/* MMIO */</span>
+    <span class="k">case</span> KVM_EXIT_HLT:      <span class="c">/* 等中断 */</span>
+    }
+}</code></pre>
+    <div class="box danger">
+      <span class="box-title">容易答错的点</span>
+      <strong>VM exit ≠ 回到 QEMU</strong>。大多数 exit（EPT violation、外部中断、MSR）在内核里就处理完并重新 entry；
+      只有需要设备模拟的才返回用户态。被问到「一次 MMIO 的路径」时要把这个区分说清楚。
+    </div>
+    <p><strong>追问：</strong>「KVM_RUN 内部做了什么？」——保存 host 上下文、加载 guest 状态、执行 VMLAUNCH/VMRESUME；硬件在 guest 模式运行，直到 exit 条件成立，再回到内核的 exit handler。</p>
+
+    <h3 id="kvm-vcpu">vCPU 就是一个普通线程</h3>
+    <ul>
+      <li>QEMU 为每个 vCPU 建一个 pthread，循环调 <code>KVM_RUN</code>，所以能看到它的 tid、能 <code>taskset</code>、能 <code>perf</code>、能绑 NUMA 节点。</li>
+      <li>guest 在 non-root 模式执行流仍是这个 host 线程；宿主时钟中断或 preemption timer 到来时，hypervisor 可以获得控制权，再让调度器抢占。</li>
+      <li>每个 vCPU 有独立 fd，所以能通过 <code>KVM_GET_REGS</code> / <code>KVM_SET_REGS</code> 直接读写寄存器（调试和热迁移都靠它）。</li>
+    </ul>
+    <p><strong>追问：</strong>「vCPU 超配会怎样？」——多个 vCPU 线程抢物理核，guest 内表现为 <code>steal time</code> 上升、延迟抖动变大；对延迟敏感的服务要 1:1 绑核。</p>
+
+    <h2 id="memory">内存虚拟化</h2>
+
+    <h3 id="mem-translate">GVA → GPA → HPA</h3>
+    <pre><code>GVA ──guest 页表（guest 自己管，CR3）──► GPA
+GPA ──EPT / NPT（hypervisor 管）──────► HPA</code></pre>
+    <p>
+      关键在于<strong>两层页表归属不同</strong>：guest 管 GVA→GPA，hypervisor 管 GPA→HPA。
+      所以 guest 改自己的页表<strong>不需要通知 hypervisor</strong> —— 这正是 EPT 的根本优势。
+    </p>
+    <p><strong>追问：</strong>「EPT 页表本身放在哪？」——放在 host 物理内存，由 hypervisor 分配；EPTP 含在 VMCS 的 VM-execution control 里，VM entry 时硬件从那里取。</p>
+
+    <h3 id="mem-shadow">影子页表 vs EPT</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>维度</th><th>影子页表</th><th>EPT / NPT</th></tr></thead>
+        <tbody>
+          <tr><td>翻译执行者</td><td>hypervisor 软件拼表</td><td>硬件两级遍历</td></tr>
+          <tr><td>guest 改页表</td><td>页表页设只读，写触发 trap 再同步</td><td>不拦截</td></tr>
+          <tr><td>内存开销</td><td>每个 guest 进程一套</td><td>每个 VM 一套</td></tr>
+          <tr><td>缺页信息</td><td>只有 guest page fault，需推断</td><td>violation 直接给出 GPA 与访问类型</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>一句话总结：EPT 把「同步两套页表」这个难题从 hypervisor 里删掉了，代价是 TLB miss 时要多走一遍页表。</p>
+    <p><strong>追问：</strong>「那 EPT 的代价具体是什么？」——最坏情况下一次 guest 访存要遍历两套页表，访存次数成倍增加；靠 TLB、paging-structure cache 和 2MB/1GB 大页缓解。</p>
+
+    <h3 id="mem-ept">EPT violation 怎么处理</h3>
+    <p>硬件给出的 exit qualification 足以判断三件事：<strong>GPA 是多少、是读/写/执行、是缺页还是权限违规</strong>。</p>
+    <ol>
+      <li><strong>普通内存缺页</strong>：分配 host page，填 EPT entry，重新 entry。</li>
+      <li><strong>MMIO 地址</strong>：交给设备模型模拟（例如 virtio 的 doorbell），<strong>不</strong>分配内存。</li>
+      <li><strong>越界或权限错误</strong>：注入异常或终止 VM。</li>
+    </ol>
+    <p>最坏路径的访存量是<strong>两级页表深度相乘</strong>：guest 每取一个页表项，这个页表项本身还要经 EPT 翻译才能读到，所以 4 级 guest 遍历 × 4 级 EPT 遍历，最坏是十几次访存，再加最终数据访问。实际靠 TLB、paging-structure cache 和 2MB/1GB 大页把它压下来 —— 别背精确数字，背「深度相乘、靠缓存和大页缓解」。</p>
+    <p><strong>追问：</strong>「怎么区分 MMIO 的 violation 和内存缺页？」——看 GPA 是否落在某个 memory region 之外、是否命中设备 BAR；KVM 用 memslot 和 <code>KVM_EXIT_MMIO</code> 来处理后者。</p>
+
+    <h3 id="mem-reclaim">内存回收：balloon 与 KSM</h3>
+    <ul>
+      <li><strong>Ballooning</strong>：guest 内装 balloon 驱动，hypervisor 让它「充气」——guest 主动交出一批页并报告页号，hypervisor 回收。是<strong>协作式</strong>回收，依赖 guest 驱动。</li>
+      <li><strong>KSM</strong>：host 扫描匿名页，内容相同的合并为一页、写时复制。省内存，但持续扫描耗 CPU。</li>
+      <li><strong>Swap</strong>：把 guest 内存换到磁盘，延迟从微秒级变成毫秒级，通常是最不得已的手段。</li>
+    </ul>
+    <p><strong>追问：</strong>「KSM 有什么安全风险？」——同页合并意味着「别人有没有这块内容」可能通过访问时序泄露，构成跨 VM 侧信道；生产环境常关闭 KSM。</p>
+
+    <h2 id="io">设备虚拟化</h2>
+
+    <h3 id="io-emul">全模拟</h3>
+    <p>guest 用真实设备驱动（如 e1000），每次寄存器访问触发 VM exit，由 QEMU 解析并改设备状态。最慢，但<strong>不需要 guest 装任何特殊驱动</strong>，兼容性最好；用于启动阶段和无法改 guest 的场景。</p>
+    <p><strong>追问：</strong>「都什么年代了还用全模拟？」——装 OS 时还没有 virtio 驱动；老系统迁移；以及作为 virtio 的兜底。</p>
+
+    <h3 id="io-virtio">virtio：virtqueue 与 kick</h3>
+    <p>split virtqueue 由三块共享内存组成，<strong>读写者严格分离</strong>：</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>区域</th><th>每项大小</th><th>谁写</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><td>Descriptor table</td><td>16 字节 × 队列长度</td><td>driver 建链，device 只读</td><td>addr / len / flags / next</td></tr>
+          <tr><td>Available ring</td><td>6 + 2 × 队列长度</td><td>driver 写，device 读</td><td>idx 递增，指向请求链头</td></tr>
+          <tr><td>Used ring</td><td>6 + 8 × 队列长度</td><td>device 写，driver 读</td><td>完成的链头与实际长度</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <pre><code><span class="c">/* driver 侧：把链头挂到 available ring */</span>
+avail-&gt;ring[avail-&gt;idx % qsz] = head_desc;
+avail-&gt;idx++;                    <span class="c">// 只递增，不回退</span>
+wmb();                           <span class="c">// 保证 desc 先可见，再发通知</span>
+iowrite16(<span class="n">0</span>, queue_notify);      <span class="c">// 写队列号 = available buffer notification</span></code></pre>
+    <p>注意 <code>avail-&gt;idx</code> 是<strong>单调递增的计数器</strong>，取模只用于定位槽位；device 靠它和 used ring 的 idx 判断有多少新请求。通知前必须有内存屏障，否则 device 可能先看到 idx 更新、再去读还没写完的 descriptor。</p>
+    <p>性能优势的本质是<strong>exit 次数的量级变化</strong>：全模拟是「每次寄存器写一次 exit」，virtio 是「一批请求一次通知」。后端可以放进内核（<code>vhost-net</code>）或独立进程（<code>vhost-user</code>），进一步减少 QEMU 参与。</p>
+    <p><strong>追问：</strong>「kick 能省掉吗？」——能。用 EVENT_IDX 做通知抑制，或干脆轮询（busy-poll，DPDK/SPDK 的做法），用 CPU 换延迟。</p>
+
+    <h3 id="io-passthrough">直通：VFIO + IOMMU</h3>
+    <p>host 上由 <code>vfio-pci</code> 接管设备，guest 装原生驱动直接访问 BAR。DMA 地址由 IOMMU 翻译，所以 guest 只能碰 hypervisor 映射给它的内存。性能接近原生，但<strong>设备被独占、不能迁移、host 不能再驱动它</strong>。</p>
+    <p><strong>追问：</strong>「为什么直通设备不能热迁移？」——hypervisor 看不到设备内部状态（队列、页表、固件），而且可能有 DMA 在途；没有可序列化的状态就没有迁移。</p>
+
+    <h3 id="io-sriov">SR-IOV：PF 与 VF</h3>
+    <ul>
+      <li><strong>PF</strong>：完整 PCIe 功能，PF 驱动跑在 host，负责创建/销毁 VF、配置 VLAN/MAC/QoS、处理 mailbox。</li>
+      <li><strong>VF</strong>：轻量 PCIe 功能，有<strong>独立配置空间、BAR、MSI-X 表</strong>和独立 BDF；VF 驱动跑在 guest，数据面不经过 PF 驱动。</li>
+      <li><strong>数量</strong>：由 SR-IOV Capability 的 InitialVFs / TotalVFs 字段声明，设备间差异很大；不要背固定上限。</li>
+      <li><strong>隔离边界</strong>：PCIe 功能视图是硬件隔离的；GPU 执行引擎在 SR-IOV 下仍是<strong>时间片共享</strong>，所以 SR-IOV 不等于性能隔离。</li>
+    </ul>
+    <p><strong>追问：</strong>「VF 还能再切吗？」——不能，VF 是叶子。要在更细粒度共享，用容器透传或 MIG。</p>
+
+    <h3 id="io-compare">四种方式对比</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>方式</th><th>数据面路径</th><th>性能</th><th>隔离</th><th>迁移</th></tr></thead>
+        <tbody>
+          <tr><td>全模拟</td><td>每次访问 exit 到 QEMU</td><td>低</td><td>强</td><td>好</td></tr>
+          <tr><td>virtio</td><td>共享内存 ring + 通知</td><td>较高</td><td>强</td><td>好</td></tr>
+          <tr><td>直通</td><td>guest 直达，IOMMU 翻译</td><td>接近原生</td><td>强（需 IOMMU）</td><td>不支持</td></tr>
+          <tr><td>SR-IOV</td><td>每 VF 独立硬件队列</td><td>接近原生</td><td>硬件隔离</td><td>不支持</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>追问：</strong>「virtio 和 SR-IOV 怎么选？」——要超配、要迁移、不依赖硬件，选 virtio；要极致性能和硬件隔离，选 SR-IOV。很多云是控制面 virtio、数据面 SR-IOV。</p>
+
+    <h2 id="iommu">IOMMU</h2>
+
+    <h3 id="iommu-dma">DMA remapping 与 IOMMU group</h3>
+    <p>没有 IOMMU 时，设备发出的地址就是物理地址，设备能写哪里完全取决于驱动给它的地址。开了 IOMMU 后设备发 IOVA，经页表译为 HPA，于是获得三个能力：<strong>越界 fault、地址空间独立、支持大页</strong>。</p>
+    <p><strong>IOMMU group</strong> 是「能与其他设备隔离的最小集合」，也是 VFIO 的<strong>所有权单位</strong>。同一 group 内的设备必须一起交给 VFIO，因为硬件无法区分它们之间的 DMA（常见原因是缺 ACS 的 PCIe 桥或多功能设备）。</p>
+    <p><strong>追问：</strong>「group 里有两个设备，能只直通一个吗？」——不能，除非拓扑允许拆 group（例如换插槽、开启 ACS 重定向）。</p>
+
+    <h3 id="iommu-irq">中断重映射</h3>
+    <p>MSI/MSI-X 的本质是设备往一个地址写数据，这个地址被解释为「向量 + 目标 CPU」。若 guest 能控制它，就能伪造任意中断、注入到别的 VM。中断重映射让设备写的是 <strong>interrupt handle</strong>，由 IOMMU 查表决定真实目标，guest 无法构造任意中断。</p>
+    <p>安全上最重要的是 <strong>DMA remapping</strong>：它决定设备能碰哪块物理内存。但要防止 guest 伪造中断注入到别的 VM，还需要中断重映射。两者的关系是：<strong>DMA remapping 是直通能成立的前提，中断重映射是多租户场景下的加固</strong>。补充一个边界：VFIO 有 no-IOMMU 模式，但它是给「用户态驱动、明确接受不安全 DMA」的场景，不能用于多租户直通。</p>
+    <p><strong>追问：</strong>「posted interrupt 和中断重映射什么关系？」——posted interrupt 是 VT-d 的中断投递优化，直接写 guest 的 posted-interrupt descriptor，避免为了注入中断而 exit；它建立在中断重映射的翻译框架上。</p>
+
+    <h3 id="iommu-ats">ATS 与 PRI</h3>
+    <ul>
+      <li><strong>ATS</strong>：设备侧缓存翻译结果（ATC），像 TLB；命中就不走 IOMMU，降低延迟。代价是页表改动后要发 <strong>ATC invalidation</strong> 保持一致。</li>
+      <li><strong>PRI</strong>：设备缺页时可以向 host 发页请求，而不是直接失败。这是 <strong>Shared Virtual Memory</strong> 的基础 —— CPU 和 GPU 共享同一套虚拟地址，GPU 缺页时按需换入。</li>
+    </ul>
+    <p><strong>追问：</strong>「ATC 不失效会怎样？」——设备用到过期的翻译，DMA 写到错误的物理页，属于数据损坏级 bug，而且极难复现。</p>
+
+    <h2 id="gpu">GPU 虚拟化</h2>
+
+    <h3 id="gpu-vgpu">vGPU：hypervisor 时间片</h3>
+    <p>hypervisor 里跑 vGPU manager，把物理 GPU 按时间片分给多个 VM；guest 装厂商的 vGPU 驱动。可以超配，部分产品支持迁移，但性能有明显损失，且依赖 license 与 hypervisor 支持。</p>
+    <p><strong>追问：</strong>「vGPU 的切换和 CPU 进程切换差在哪？」——GPU 上下文大得多（寄存器、页表、显存映射、引擎状态），切换成本高，所以调度粒度通常是毫秒级，远大于 CPU 的调度粒度。</p>
+
+    <h3 id="gpu-sriov">SR-IOV：功能级切分</h3>
+    <p>GPU 在硬件上实现多个 VF，每个 VF 有独立 BAR 和中断，直接分给 VM。数据面绕过 hypervisor，性能接近原生。NVIDIA 从 Ampere 起支持。</p>
+    <p><strong>关键区别</strong>：SR-IOV 切的是 <strong>PCIe 功能视图</strong>，GPU 执行引擎默认仍是时间片共享；真正把 SM、L2、显存控制器切开的是 MIG。所以「SR-IOV = 性能隔离」是错的。</p>
+    <p><strong>追问：</strong>「那 SR-IOV 的隔离边界到底在哪？」——配置空间、BAR、MSI-X、错误上报是硬件隔离的；执行资源和显存带宽是共享的。<strong>安全隔离成立，性能隔离不成立。</strong></p>
+
+    <h3 id="gpu-passthrough">直通：整卡独占</h3>
+    <p>用 VFIO 把整块 GPU 交给一个 VM，性能 100%，隔离最强，但一块卡只能给一个 VM，且不能迁移。AI 训练集群里最常见 —— 训练任务本来就占满整卡。</p>
+    <p><strong>追问：</strong>「直通的 VM 里能用 vGPU 的功能吗？」——不能。直通装的是原生驱动，vGPU 装的是 vGPU 驱动，两条软件栈互斥。</p>
+
+    <h3 id="gpu-mig">MIG：GPU 内部分区</h3>
+    <p>MIG 在 GPU 内部切分 SM slice、L2 slice、显存控制器与显存容量，instance 之间是<strong>硬件分区</strong>，隔离性与性能可预测性都好于时间片。切片数量由 GPC 数量决定（A100 为 7 个），每个 slice 还能再切成更小的 compute instance；具体上限以对应型号的官方文档为准。</p>
+    <p>MIG 不改变 PCIe 功能视图，所以它主要在容器 / K8s 场景使用；给 VM 用需要额外的支持。</p>
+    <p><strong>追问：</strong>「MIG 和 SR-IOV VF 的本质区别？」——MIG 切的是<strong>执行资源</strong>（SM/L2/显存控制器），VF 切的是<strong>PCIe 功能</strong>；一个实例 OOM 不会影响另一个，这是硬件分区带来的。</p>
+
+    <h3 id="gpu-compare">四方案对比</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>方案</th><th>切分层</th><th>隔离</th><th>性能</th><th>迁移</th><th>典型场景</th></tr></thead>
+        <tbody>
+          <tr><td>vGPU</td><td>hypervisor 时间片</td><td>软件隔离</td><td>有损失</td><td>部分支持</td><td>VDI、图形工作站</td></tr>
+          <tr><td>SR-IOV</td><td>PCIe VF</td><td>功能隔离、资源共享</td><td>接近原生</td><td>不支持</td><td>多租户推理</td></tr>
+          <tr><td>直通</td><td>整卡</td><td>最强</td><td>原生</td><td>不支持</td><td>训练、HPC</td></tr>
+          <tr><td>MIG</td><td>GPU 内部 SM/显存</td><td>硬件分区</td><td>接近原生</td><td>不支持</td><td>容器共享</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>追问：</strong>「为什么没有一种方案同时满足弹性、性能和迁移？」——弹性要求资源可分时复用（时间片），性能要求资源独占（硬件分区），迁移要求状态可序列化。三者互相制约，这正是 GPU 虚拟化难的根本原因。</p>
+
+    <h3 id="gpu-migration">GPU 迁移为什么难</h3>
+    <ol>
+      <li><strong>显存状态</strong>：几十 GB 需要脏页跟踪与迭代拷贝，GPU 侧没有和 CPU 等价的脏位机制。</li>
+      <li><strong>正在跑的 kernel</strong>：必须先 quiesce（停 stream、等 kernel 完成），停机时间直接计入迁移时间。</li>
+      <li><strong>PCIe 状态</strong>：配置空间、BAR、MSI-X、FLR 语义，换机器后 BDF 可能变化，需要重建。</li>
+      <li><strong>设备内部状态</strong>：GPU 页表、TLB、上下文、固件状态、copy engine 队列。</li>
+    </ol>
+    <p><strong>追问：</strong>「为什么 vGPU 能迁移，直通不能？」——vGPU 的状态由 vGPU manager 掌握，有脏页跟踪和状态序列化接口；直通把物理设备整个交出去，hypervisor 看不到内部状态。<strong>谁能序列化状态，谁就能迁移。</strong></p>
+
+    <h2 id="container">容器与隔离</h2>
+
+    <h3 id="ns">namespace：看得见什么</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>namespace</th><th>隔离内容</th><th>表现</th></tr></thead>
+        <tbody>
+          <tr><td>mnt</td><td>挂载点</td><td>独立根文件系统</td></tr>
+          <tr><td>pid</td><td>进程 ID</td><td>容器内 1 号进程是应用</td></tr>
+          <tr><td>net</td><td>网络栈、网卡、端口</td><td>独立 IP 与 lo</td></tr>
+          <tr><td>ipc</td><td>System V IPC、POSIX 消息队列</td><td>不能直接共享内存段</td></tr>
+          <tr><td>uts</td><td>hostname / domain name</td><td>独立主机名</td></tr>
+          <tr><td>user</td><td>UID / GID 映射</td><td>容器 root 可映射为宿主普通用户</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>另有 cgroup namespace（隔离 cgroup 视图）和 time namespace（隔离时钟偏移）。创建接口是 <code>clone(CLONE_NEW*)</code> 或 <code>unshare</code>。</p>
+    <p><strong>追问：</strong>「namespace 能限制 CPU 吗？」——不能。namespace 只改变可见性，限制资源要用 cgroup，两者正交。</p>
+
+    <h3 id="cgroup">cgroup：能用多少</h3>
+    <ul>
+      <li><strong>v1</strong>：每个子系统一棵独立的树，同一进程在不同树里的位置不一致，管理复杂。</li>
+      <li><strong>v2</strong>：<strong>统一层级</strong>，所有控制器挂在一棵树上，逐层通过 <code>cgroup.controllers</code> / <code>cgroup.subtree_control</code> 启用。</li>
+      <li>常用接口：<code>cpu.max</code>（带宽）、<code>memory.max</code>（硬限制，超了 OOM）、<code>memory.high</code>（软限制，超了节流并回收）、<code>io.max</code>、<code>pids.max</code>。</li>
+    </ul>
+    <p><strong>追问：</strong>「memory.high 和 memory.max 的区别？」——high 是软限，超过后内核会节流并积极回收，尽量不杀进程；max 是硬限，超过直接触发 OOM。生产上常用 high 做缓冲。</p>
+
+    <h3 id="c-vs-vm">容器 vs 虚拟机</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>维度</th><th>容器</th><th>虚拟机</th></tr></thead>
+        <tbody>
+          <tr><td>内核</td><td><strong>共享宿主内核</strong></td><td>独立内核</td></tr>
+          <tr><td>隔离机制</td><td>namespace + cgroup + capability/seccomp/LSM</td><td>硬件虚拟化 + hypervisor</td></tr>
+          <tr><td>启动</td><td>毫秒级</td><td>秒级到分钟级</td></tr>
+          <tr><td>隔离强度</td><td>弱，内核漏洞可能逃逸</td><td>强，硬件边界</td></tr>
+          <tr><td>运行态迁移</td><td>困难</td><td>成熟</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>「共享内核」是所有差异的根源。折中方案：Kata Containers（容器外套轻量 VM）、gVisor（用户态内核拦截系统调用）。</p>
+    <p><strong>追问：</strong>「容器逃逸的常见路径？」——特权容器 + 宿主机设备/路径挂载、内核漏洞提权、可写的 <code>/proc/sys</code> 或 <code>/sys</code>、以及历史上 cgroup release_agent 一类配置错误。</p>
+
+    <h3 id="gpu-container">GPU 容器：透传，不是虚拟化</h3>
+    <p>容器里看到 GPU，靠的是把宿主设备和驱动「注入」进去，共有四步：</p>
+    <ol>
+      <li>设备节点：<code>/dev/nvidia0</code>、<code>/dev/nvidiactl</code>、<code>/dev/nvidia-uvm</code>。</li>
+      <li>驱动库：<code>libcuda.so</code>、<code>libnvidia-ml.so</code>、<code>nvidia-smi</code>，版本必须与宿主驱动匹配。</li>
+      <li>device cgroup 放行设备号（v1 用 <code>devices.allow</code>，v2 用 eBPF）。</li>
+      <li>nvidia-container-toolkit 通过 OCI hook 在容器启动时完成上述注入。</li>
+    </ol>
+    <pre><code>nvidia-smi -L                       <span class="c"># host 上的物理 GPU</span>
+docker run --gpus all nvidia/cuda:12.4-base nvidia-smi
+<span class="c"># 本质：--device /dev/nvidia* + 注入驱动库 + device cgroup 放行</span></code></pre>
+    <div class="box danger">
+      <span class="box-title">易错点</span>
+      容器里的 <code>nvidia-smi</code> 看到的是<strong>宿主物理 GPU</strong>，不是虚拟设备；
+      默认情况下还能看到别的容器在跑的进程。这正是「容器隔离弱于 VM」在 GPU 上的体现。
+    </div>
+    <p><strong>追问：</strong>「多个容器怎么安全共享一块 GPU？」——device cgroup 只做访问控制，不做资源隔离；要隔离用 MIG（硬件分区），要限额用 MPS 或时间片，但都弱于 VM。</p>
+
+    <h2 id="qa">高频问答</h2>
+
+    <details class="qa">
+      <summary>为什么设备直通必须开 IOMMU？</summary>
+      <div class="a">
+        <ul>
+          <li><strong>DMA 翻译</strong>：没有 IOMMU 时，设备发出的地址被当作物理地址，guest 驱动可以 DMA 到宿主任意内存，包括内核代码页。</li>
+          <li><strong>越界保护</strong>：有 IOMMU 时 guest 只能访问被映射的 IOVA，越界触发 IOMMU fault，可以只杀这个 VM。</li>
+          <li><strong>中断重映射</strong>：MSI 本质是设备写地址触发中断，不重映射的话 guest 能伪造中断注入别的 VM。</li>
+          <li><strong>IOMMU group</strong>：它是 VFIO 的所有权单位，同 group 设备必须整体交给 VFIO。</li>
+        </ul>
+        <p>补充：VFIO 存在 no-IOMMU 模式，但仅用于明确接受不安全 DMA 的用户态驱动场景，不能用于多租户直通。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>virtio 为什么比全模拟快？</summary>
+      <div class="a">
+        <ul>
+          <li><strong>exit 批量化</strong>：全模拟是每个寄存器访问一次 exit；virtio 是一批请求一次 available buffer notification。</li>
+          <li><strong>共享内存</strong>：descriptor table、available ring、used ring 都在 guest 与 host 共享的内存里，不需要每次陷入。</li>
+          <li><strong>无锁的单生产者单消费者</strong>：driver 只写 available ring，device 只写 used ring，不需要每次进 hypervisor 同步。</li>
+          <li><strong>后端可下沉</strong>：vhost-net 把后端放进内核，vhost-user 放进独立进程，减少 QEMU 参与。</li>
+        </ul>
+        <p>本质是 exit 数量的量级下降，不是「模拟得更快」。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>EPT 相比影子页表的优势？</summary>
+      <div class="a">
+        <ul>
+          <li><strong>不拦截 guest 页表写</strong>：影子页表要把页表页设为只读，每次修改都 trap 并同步影子表；EPT 下 guest 随意改，硬件翻译时自动生效。</li>
+          <li><strong>内存开销解耦</strong>：影子页表每个 guest 进程一套，EPT 每个 VM 一套。</li>
+          <li><strong>缺页信息精确</strong>：EPT violation 直接给出 GPA、访问类型、是缺页还是权限问题。</li>
+          <li><strong>实现简单</strong>：hypervisor 里那套极其复杂的同步逻辑消失了。</li>
+        </ul>
+        <p>代价：TLB miss 时多遍历一套页表，所以大页和 TLB 优化在虚拟化环境收益很大。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>vGPU 和 SR-IOV 怎么选？</summary>
+      <div class="a">
+        <ul>
+          <li><strong>vGPU</strong>：需要超配（一块卡分给多个用户）、需要迁移、能接受性能损失，典型是 VDI 与图形工作站。</li>
+          <li><strong>SR-IOV</strong>：VM 数量固定、要接近原生性能和硬件隔离、不需要迁移，典型是多租户推理。</li>
+          <li><strong>直通</strong>：任务占满整卡，追求最强隔离与原生性能，典型是训练和 HPC。</li>
+          <li><strong>MIG</strong>：容器 / K8s 里多个小任务共享大卡，要硬件分区的隔离和可预测性。</li>
+        </ul>
+        <p>一句话：要弹性选 vGPU，要性能选 SR-IOV / 直通，要容器内硬件隔离选 MIG。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>容器里的 GPU 是怎么看到的？</summary>
+      <div class="a">
+        <ol>
+          <li>注入设备节点：<code>/dev/nvidia0</code>、<code>/dev/nvidiactl</code>、<code>/dev/nvidia-uvm</code>。</li>
+          <li>注入驱动库：<code>libcuda.so</code>、<code>libnvidia-ml.so</code>、<code>nvidia-smi</code>，版本需与宿主驱动匹配。</li>
+          <li>device cgroup 放行设备号（v1 <code>devices.allow</code>，v2 eBPF）。</li>
+          <li>nvidia-container-toolkit 用 OCI hook 在容器启动时完成以上步骤。</li>
+        </ol>
+        <p>所以容器里是<strong>真实物理 GPU</strong>，没有驱动虚拟化层；隔离依赖 device cgroup 与 MIG。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>VM exit 太多，怎么定位？</summary>
+      <div class="a">
+        <pre><code>perf kvm stat live                     <span class="c"># 实时看 exit reason 分布</span>
+perf kvm stat record -a sleep <span class="n">10</span>
+perf kvm stat report                   <span class="c"># 按 reason 聚合</span>
+perf record -e kvm:kvm_exit -a sleep <span class="n">10</span></code></pre>
+        <p>按 reason 对症：</p>
+        <ul>
+          <li><code>EPT_VIOLATION</code> 多 → 检查大页、缺页频率、NUMA 配置。</li>
+          <li><code>IO_INSTRUCTION</code> / MMIO 多 → 设备是全模拟，换 virtio。</li>
+          <li><code>MSR_WRITE</code> 多 → guest 轮询 MSR，用 MSR bitmap 放行。</li>
+          <li><code>HLT</code> 多 → 空闲循环，开 halt polling。</li>
+          <li>外部中断多 → 考虑 posted interrupt、APICv、vCPU 绑核。</li>
+        </ul>
+        <p>还可以看 <code>/sys/kernel/debug/kvm/</code> 下的计数器和 ftrace 的 <code>kvm_exit</code> tracepoint。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>SR-IOV 的 PF 和 VF 是什么关系？</summary>
+      <div class="a">
+        <ul>
+          <li><strong>PF</strong>：完整 PCIe 功能，驱动在 host，负责创建/销毁 VF、配置 VLAN/MAC/QoS、处理 mailbox。</li>
+          <li><strong>VF</strong>：轻量 PCIe 功能，有独立配置空间、BAR、MSI-X 和独立 BDF；驱动在 guest，数据面不经过 PF 驱动。</li>
+          <li><strong>数量</strong>：由 SR-IOV Capability 的 InitialVFs / TotalVFs 声明，设备间差异大。</li>
+          <li><strong>依赖</strong>：PF 故障会影响其下所有 VF，所以 PF 通常由云厂商控制，不交给租户。</li>
+        </ul>
+        <p>注意：SR-IOV 切的是 PCIe 功能视图，GPU 执行引擎仍是时间片共享，不是性能隔离。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>GPU 直通后宿主机还能不能用 nvidia-smi？</summary>
+      <div class="a">
+        <p><strong>宿主机上不能正常用</strong>：设备已被 <code>vfio-pci</code> 绑定，NVIDIA 驱动没有接管，<code>nvidia-smi</code> 看不到它。</p>
+        <ul>
+          <li>验证直通：<code>lspci -k -s &lt;BDF&gt;</code> 应显示 <code>Kernel driver in use: vfio-pci</code>。</li>
+          <li>guest 里装完整驱动后 <code>nvidia-smi</code> 正常，看到的就是物理卡。</li>
+          <li>vGPU 场景不同：host 上装的是 vGPU manager，可以通过它看到各 VM 的 vGPU 实例。</li>
+        </ul>
+        <p>想监控直通卡的功耗/温度，只能走 BMC/IPMI 等带外通道，因为 host 驱动栈已经不碰这块设备。</p>
+      </div>
+    </details>
+
+    <div class="box ok" style="margin-top:34px">
+      <span class="box-title">下一步</span>
+      去 <a href="../quiz/index.html?cat=virt">刷虚拟化专题</a>。然后读 <a href="net.html">计算机网络</a>。
+    </div>
+  </main>
+</div>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

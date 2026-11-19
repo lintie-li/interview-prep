@@ -1,0 +1,172 @@
+{
+  "questions": [
+    {
+      "id": "d-001",
+      "q": "线上服务 CPU 使用率异常高，应该怎么开始查？",
+      "opts": [
+        "直接用 gdb attach 上去打断点单步",
+        "先看整体指标（top / perf stat 拿 IPC、上下文切换、cache miss），确认是 CPU 真忙还是等锁、等 IO，再决定用 perf record 还是 off-CPU 分析",
+        "重启进程恢复服务再说",
+        "直接上 eBPF 写脚本"
+      ],
+      "a": 1,
+      "exp": "第一步永远是分层定位，不要一上来就 gdb。`top` 看是 us 高还是 sy 高；`perf stat -p <pid> sleep 5` 拿 IPC、context-switch、page-fault、cache-miss。IPC 低说明在等内存/指令cache，sy 很高说明系统调用或内核态热点。只有确定是 on-CPU 热点，`perf record -g` 才有意义。",
+      "level": "高频",
+      "tags": ["perf", "方法论"]
+    },
+    {
+      "id": "d-002",
+      "q": "`perf record` 采到的火焰图里某个函数占 40%，能直接断定它是瓶颈吗？",
+      "opts": [
+        "能，占比最高就是瓶颈",
+        "不能。采样是概率性的，被 inline 或寄存器分配优化过的代码可能被错误归因到相邻函数；还需看 IPC、cache miss 等指标确认是计算受限还是访存受限",
+        "不能，因为 perf 只支持用户态",
+        "能，但只对内核态有效"
+      ],
+      "a": 1,
+      "exp": "采样有一定概率误差：栈回溯在帧指针省略（-fomit-frame-pointer）时依赖 DWARF 展开，展开失败会把开销算到调用者身上。另外「热」不等于「慢」——一个函数占比高可能只是因为它本来就该干很多活。要结合 `perf stat` 判断瓶颈类型，用 `perf annotate` 看是哪条指令。",
+      "level": "高频",
+      "tags": ["perf", "火焰图"]
+    },
+    {
+      "id": "d-003",
+      "q": "ftrace 的 `function_graph` trace 中，行首的 `+`、`!`、`#` 分别表示什么？",
+      "opts": [
+        "表示返回值正负",
+        "表示函数耗时超过阈值：`+` 约 10µs、`!` 约 100µs、`#` 约 1ms（阈值由 `funcgraph-overhead` 控制，可调）",
+        "表示 CPU 核编号",
+        "表示函数被调用的次数"
+      ],
+      "a": 1,
+      "exp": "这些标记是 ftrace 帮你做的一阶过滤，用来在几万行 trace 里快速找出慢函数，不用自己算时间差。默认阈值分档为 10µs / 100µs / 1ms。调优方法：`echo funcgraph-threshold=500 > /sys/kernel/tracing/options/funcgraph-...`（具体选项名以当前内核为准），或直接用 `trace-cmd` 的 `--max-graph-depth` 降噪。",
+      "level": "中频",
+      "tags": ["ftrace", "内核调试"]
+    },
+    {
+      "id": "d-004",
+      "q": "关于 lockdep，正确的说法是？",
+      "opts": [
+        "它是运行时死锁检测器，会自动解锁",
+        "它在运行时记录锁的获取顺序，通过锁类（lock class）建立依赖图，一旦发现潜在循环依赖就报 splat；它是静态锁序校验，不解决锁竞争性能问题",
+        "它只能检测自旋锁，不能检测 mutex",
+        "它要求所有锁在同一 CPU 上获取"
+      ],
+      "a": 1,
+      "exp": "lockdep 检查的是「锁序」而不是「当下是否真死锁」，所以它能在死锁发生前报警。它同时覆盖 spinlock / mutex / rwsem / RCU 等，能报出 ABBA 与自我递归两类问题。注意开启后开销明显（通常是 debug 内核），且动态初始化（`spin_lock_init`）的锁才被跟踪；`raw_spinlock` 与 `spinlock` 是不同 class。",
+      "level": "中频",
+      "tags": ["lockdep", "并发"]
+    },
+    {
+      "id": "d-005",
+      "q": "内核只能通过打开 `CONFIG_DEBUG_ATOMIC_SLEEP` 才能发现什么类型的 bug？",
+      "opts": [
+        "内存越界",
+        "在原子上下文（中断处理、持有 spinlock、关抢占区）中睡眠，比如在 spinlock 里调用带 GFP_KERNEL 的 kmalloc 或 mutex_lock",
+        "文件描述符泄漏",
+        "栈溢出"
+      ],
+      "a": 1,
+      "exp": "原子上下文睡眠会导致调度器在不该调度的地方调度，轻则卡死重则崩溃，且现象极难复现。`CONFIG_DEBUG_ATOMIC_SLEEP` 会在 `might_sleep()` 里检查 `preempt_count` / 中断上下文，直接报 “BUG: sleeping function called from invalid context” 并打印完整栈。KASAN 管的是内存越界，`CONFIG_DEBUG_KMEMLEAK` 管泄漏，三者的职责不要混。",
+      "level": "中频",
+      "tags": ["内核调试", "并发"]
+    },
+    {
+      "id": "d-006",
+      "q": "内核 panic 或 oops 之后，要事后分析现场，最可靠的做法是？",
+      "opts": [
+        "在 dmesg 里翻，没有了就没办法",
+        "提前配置 kdump（crashkernel 保留内存 + kexec 在崩溃时启动捕获内核），把 vmcore 存下来，再用 crash 工具分析 vmlinux + vmcore",
+        "重启后看 /var/log/messages 就够",
+        "用 gdb attach 到已崩溃的内核"
+      ],
+      "a": 1,
+      "exp": "kdump 用 kexec 在 panic 时把第二个内核拉起来，原内核内存完整保留成 vmcore，是所有现场信息的唯一完整来源。`crash vmlinux vmcore` 之后可以 `bt` 看栈、`log` 看 dmesg、`ps` 看任务、`kmem` 看内存。此外 `pstore`/`ramoops` 会在重启后保留 oops 文本，`sysrq` 组合键 `c`（crash）、`t`（任务栈）、`m`（内存）可以在卡死时主动抓现场。",
+      "level": "高频",
+      "tags": ["kdump", "内核调试"]
+    },
+    {
+      "id": "d-007",
+      "q": "bpftrace 相比 ftrace 的核心优势是？",
+      "opts": [
+        "性能更好",
+        "可以把任意探针（kprobe/tracepoint/uprobe）的事件聚合到内核态 map 里做统计，只把汇总结果带回用户态，因此能以极低开销分析高频事件",
+        "只能用于网络",
+        "不需要 root"
+      ],
+      "a": 1,
+      "exp": "ftrace 的 trace buffer 是「逐条记录」，高频事件下几秒就能写出几 GB；bpftrace 的思路是「在内核里先聚合」（count/avg/hist），用户态只拿到几十行结果。所以看单次调用适合 ftrace/perf，做统计分布（延迟分位数、调用次数、size 分布）适合 eBPF。经典一句：`bpftrace -e 'kprobe:vfs_read { @[comm] = count(); }'`。",
+      "level": "中频",
+      "tags": ["eBPF", "bpftrace"]
+    },
+    {
+      "id": "d-008",
+      "q": "怀疑一次延迟抖动来自「进程等待」，应该看哪类数据？",
+      "opts": [
+        "on-CPU 火焰图",
+        "off-CPU 分析：记录进程离开 CPU 到重新运行的时间（`perf sched`、`offcputime`、`runqlat`），它才能回答「等锁 / 等 IO / 等 CPU 调度」",
+        "只看 CPU 使用率",
+        "看 cache miss 就够"
+      ],
+      "a": 1,
+      "exp": "on-CPU 火焰图只覆盖「正在跑」的时间，进程在等锁或等 IO 时不在 CPU 上，在火焰图里完全不可见——这是新手最常踩的坑。off-CPU 可用 bpftrace 的 `offcputime`（按栈聚合阻塞时长）、`runqlat`（等 CPU 调度延迟分布）、`perf sched latency`。有锁的话还要配合 `perf lock` 看具体是哪把锁。",
+      "level": "高频",
+      "tags": ["perf", "火焰图", "方法论"]
+    },
+    {
+      "id": "d-009",
+      "q": "用户态进程内存持续增长，如何区分「泄漏」与「本应如此」？",
+      "opts": [
+        "看 RSS 大了就是泄漏",
+        "先看 VSS/RSS/PSS 的差异与 smaps 的分类统计；确认是堆增长还是 mmap/页缓存；再用 valgrind/memleak 或 ASan 的 LeakSanitizer 定位分配点",
+        "直接重启进程",
+        "只要 GC 跑过不掉就是泄漏"
+      ],
+      "a": 1,
+      "exp": "RSS 大不一定是泄漏：glibc malloc 的 arena 与碎片、mmap 的页缓存、线程栈（默认 8MB/线程）都会推高 RSS。`/proc/<pid>/smaps_rollup` 能看到 PSS，容器环境更该看它。确认是堆泄漏后用 valgrind --leak-check=full（慢）、或 ASan 的 LSan（快，编译期插桩）。内核态泄漏用 `CONFIG_DEBUG_KMEMLEAK` + `/sys/kernel/debug/kmemleak`。",
+      "level": "中频",
+      "tags": ["内存", "valgrind"]
+    },
+    {
+      "id": "d-010",
+      "q": "遇到偶发问题，最有效的推进方式通常是？",
+      "opts": [
+        "反复重试直到问题消失",
+        "把「偶发」变成「必然」：用二分法缩小范围、写最小复现、加日志/加探针统计特征（出现时的参数、负载、时序），必要时用 stress-ng、tc netem、fault injection 放大条件",
+        "等它下次再出现",
+        "把日志级别调到 debug 全部打开"
+      ],
+      "a": 1,
+      "exp": "偶发问题的本质是「触发条件概率低」，不是「没有规律」。二分法（按版本、按配置、按线程数、按时间）能把范围压到极小；最小复现让后续调试成本从小时级降到分钟级。放大条件很关键：并发问题加线程数、网络问题注入延迟丢包、内存问题限制 cgroup 内存制造 OOM。`debug` 全开往往因开销过大反而改变时序，让问题更难复现。",
+      "level": "高频",
+      "tags": ["方法论", "复现"]
+    },
+    {
+      "id": "d-011",
+      "q": "`perf stat` 显示某进程 IPC 只有 0.3（现代 CPU 通常在 1~3），最不可能的解释是？",
+      "opts": [
+        "大量 cache miss，CPU 大部分时间在等内存",
+        "分支预测失败率高，流水线频繁清空",
+        "程序是纯计算密集型且数据全在 L1",
+        "存在大量系统调用导致用户态/内核态切换"
+      ],
+      "a": 2,
+      "exp": "纯计算 + 数据全在 L1 恰恰是 IPC 最理想的情况，通常能跑到 2 以上。IPC 低意味着「每个周期退休的指令少」，典型原因是 stall：等内存（`perf stat` 看不出的话要看 `perf c2c` 或 cache 事件）、分支失败（看 `branch-misses`）、长延迟指令（除法、非对齐访存）。用 `perf stat -e cycles,instructions,cache-misses,branch-misses` 一起看才能定性。",
+      "level": "中频",
+      "tags": ["perf", "性能"]
+    },
+    {
+      "id": "d-012",
+      "q": "排查 GPU 上「训练慢」，第一步正确的切分是？",
+      "opts": [
+        "直接看单个 kernel 的 SASS 指令",
+        "先用 Nsight Systems 看整条时间线：GPU 是空转等数据（CPU/IO 瓶颈、同步点太多），还是 GPU 一直忙（需要 Nsight Compute 深入单 kernel）",
+        "先换更快的 GPU 型号",
+        "先看理论 FLOPs 峰值"
+      ],
+      "a": 1,
+      "exp": "这是两套完全不同的工具和结论：如果时间线上 GPU 有大段空洞，问题在数据加载、Python 开销、频繁同步、D2H 拷贝，用 Nsight Compute 看 kernel 一点用没有。只有确认 GPU 利用率高、kernel 背靠背执行，才进入 Nsight Compute 看 SM 利用率、显存带宽、occupancy 这三个指标。顺序搞反是面试里最常见的减分点。",
+      "level": "高频",
+      "tags": ["GPU", "Nsight", "方法论"]
+    }
+  ]
+}

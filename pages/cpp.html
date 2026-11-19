@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C / C++ 系统编程 · 面试准备</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="cpp">
+<div id="topbar" data-base="../"></div>
+<div style="position:sticky;top:56px;z-index:49;height:3px;background:transparent"><i id="read-bar" style="display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--purple))"></i></div>
+
+<div class="wrap">
+<div class="layout">
+  <aside class="sidebar"><div id="toc"></div></aside>
+
+  <main class="content">
+    <h1>C / C++ 系统编程</h1>
+    <p>
+      NVIDIA 的 JD 第一条硬门槛是 <strong>"Strong C programming skills"</strong>，后面还会跟
+      "phenomenal C/C++ skills"。它考的不是语法，而是：一个 <code>struct</code> 在内存里长什么样、
+      一条 <code>atomic</code> 在 x86 上生成什么指令、哪一行代码因为 UB 被编译器整个删掉。
+      这一页只收敛这些"答错就露底"的点。
+    </p>
+
+    <div class="box">
+      <span class="box-title">这一页怎么用</span>
+      时间紧就按 <a href="#ub">UB</a> → <a href="#concurrency">内存模型</a> → <a href="#abi">ABI</a> 读。
+      这三块是"用户态驱动 + 内核"岗位区分度最高的地方：写错不报错，只在客户机器上偶发挂死。
+      <a href="#layout">对象模型</a>和 <a href="#c">C 深水区</a>是必须条件反射的基本功。
+    </div>
+
+    <h2 id="layout">内存布局与对象模型</h2>
+    <div class="box">
+      <span class="box-title">面试官会问</span>
+      <ul>
+        <li>这个结构体 <code>sizeof</code> 多少？换个成员顺序呢？</li>
+        <li>虚函数表在内存里怎么摆？调一次虚函数多花什么？</li>
+        <li>多重继承下 <code>this</code> 指针怎么调整？对象切片切掉了什么？</li>
+      </ul>
+    </div>
+
+    <h3 id="address-space">进程地址空间</h3>
+    <p>
+      x86-64 四级页表下用户态是 <code>0x0</code> ~ <code>0x0000_7fff_ffff_ffff</code>（128 TB），
+      内核在高半区。从低到高：<code>.text</code>（r-x，含 PLT）、<code>.rodata</code>（r--）、
+      <code>.data</code>（rw-，初值来自文件）、<code>.bss</code>（rw-，<strong>不占文件空间</strong>，
+      ELF 只记录大小）、heap（<code>brk</code>）、mmap 区、stack。
+    </p>
+    <p>
+      <code>.bss</code> 省的是<strong>文件体积</strong>而不是内存：它在运行时是一段匿名可读写映射，
+      页表先指向只读的全局零页，第一次写触发 COW 才分配真正的物理页。所以"声明了但没碰过"的大数组，
+      物理内存基本不花。GPU 驱动里大块设备内存通常走 <code>mmap</code> 而不是 heap，
+      面试时能主动说出"这条路径不经过 <code>brk</code>"是加分项。
+    </p>
+    <p><strong>追问：</strong>为什么 <code>.bss</code> 里的全局数组不写初值就能省磁盘？—— 零页共享 + 按需分页，未触碰的页一个物理页都不用。</p>
+
+    <h3 id="align">对齐规则与 sizeof</h3>
+    <p>规则只有三句：成员偏移必须是 <code>min(成员自身对齐, pack)</code> 的倍数；
+      结构体对齐取 <code>min(成员对齐的最大值, pack)</code>；<code>sizeof</code> 向上取整到结构体对齐的倍数。剩下全是算术。</p>
+    <pre><code><span class="k">struct</span> A { <span class="k">char</span> c; <span class="k">int</span> i; <span class="k">char</span> d; };   <span class="c">// sizeof = 12</span>
+<span class="k">struct</span> B { <span class="k">char</span> c; <span class="k">char</span> d; <span class="k">int</span> i; };   <span class="c">// sizeof = 8（重排省 4 字节）</span>
+<span class="k">struct</span> C { };                              <span class="c">// C++: 1；C 标准不允许空结构体</span>
+<span class="k">struct</span> V { <span class="k">virtual</span> <span class="k">void</span> f(); };            <span class="c">// Itanium ABI: 8（只有一个 vptr）</span>
+<span class="k">struct</span> W { <span class="k">virtual</span> <span class="k">void</span> f(); <span class="k">int</span> x; }; <span class="c">// 16（vptr 8 + int 4 + pad 4）</span></code></pre>
+    <p>
+      空类为什么是 1 而不是 0：C++ 要求同类型的不同对象地址不同，数组元素不能重叠。
+      C 里空结构体非法，GCC 作为扩展给 0，别拿它写可移植代码。
+    </p>
+    <p>
+      虚继承不再给具体数字——它多出的是"虚基类偏移表"这一层间接，布局依 ABI 而定。
+      正确做法是 <code>pahole -C Type ./a.out</code> 或 <code>g++ -fdump-lang-class</code> 看真实布局，
+      而不是背某个数。驱动里看 UAPI 结构体时尤其要这样核对。
+    </p>
+    <p><strong>追问：</strong><code>__attribute__((packed))</code> 的代价？—— 消除填充，但成员可能跨越 cache line，且未对齐访问在 ARM 上可能 fault；DMA 描述符必须按硬件规定的布局，通常只能 packed。</p>
+
+    <h3 id="vtable">vtable 布局与虚调用开销</h3>
+    <p>Itanium ABI（Linux 上 GCC/Clang 都用它）下，对象偏移 0 是 vptr，指向 vtable 的第一个函数槽。表头前面还有两项：</p>
+    <pre><code>vtable[-2] = &amp;typeinfo          <span class="c">// RTTI</span>
+vtable[-1] = offset_to_top      <span class="c">// 多重继承时用于 this 调整</span>
+vtable[ 0] = &amp;Derived::f
+vtable[ 1] = &amp;Derived::g</code></pre>
+    <p>一次虚调用至少是两次依赖访存，最后一次是间接跳转（下面 8 行是 <code>g++ -O2 -S</code> 的真实输出）：</p>
+    <pre><code><span class="k">int</span> call(Base* b) { <span class="k">return</span> b-&gt;f() + <span class="n">1</span>; }
+
+<span class="c"># x86-64 -O2</span>
+movq  (%rdi), %rax     <span class="c"># rax = vptr</span>
+call  *(%rax)          <span class="c"># 目标地址直接从 vtable 里取出并跳转</span>
+addl  $1, %eax
+
+<span class="c"># 尾调用（返回值直接用）会被优化成：</span>
+<span class="c">#   movq (%rdi), %rax</span>
+<span class="c">#   jmp  *(%rax)</span></code></pre>
+    <p>
+      开销不在"多几条指令"，而在<strong>间接跳转让分支预测器和取指单元失效</strong>（mispredict 约 15~20 cycle），
+      以及<strong>编译器无法内联</strong>，后面的常量传播、死代码消除全部跟着丢。
+      <code>final</code>、栈上具体对象、LTO 都可能把它去虚化回直接调用。
+    </p>
+    <p><strong>追问：</strong>构造函数里调虚函数为什么不会派发到子类？—— 构造期间 vptr 被逐层设成当前类的 vtable；对纯虚函数的调用通常会落到 <code>__cxa_pure_virtual</code> 并 abort。</p>
+
+    <h3 id="mi">多重继承、this 调整与切片</h3>
+    <pre><code><span class="k">struct</span> B1 { <span class="k">virtual</span> <span class="k">void</span> f(); <span class="k">int</span> a; };  <span class="c">// 16: vptr(0) a(8) pad</span>
+<span class="k">struct</span> B2 { <span class="k">virtual</span> <span class="k">void</span> g(); <span class="k">int</span> b; };  <span class="c">// 16</span>
+<span class="k">struct</span> D : B1, B2 { <span class="k">void</span> f() <span class="k">override</span>; <span class="k">void</span> g() <span class="k">override</span>; };
+<span class="c">// sizeof(D) == 32；B1 子对象在 0，B2 子对象在 16</span></code></pre>
+    <p>
+      <code>D</code> 有<strong>两个 vptr</strong>。通过 <code>B2*</code>（值等于 <code>d+16</code>）调 <code>g()</code> 时，
+      <code>B2</code> 那张表里放的不是 <code>D::g</code> 本身，而是 thunk：
+    </p>
+    <pre><code>sub  $16, %rdi     <span class="c"># 把 B2* 调回 D*</span>
+jmp  D::g</code></pre>
+    <p>
+      所以 <code>static_cast&lt;B2*&gt;(d)</code> 和 <code>reinterpret_cast&lt;B2*&gt;(d)</code> 结果不同：
+      前者会加偏移，后者原样返回，通常指向错误位置。
+    </p>
+    <pre><code><span class="k">void</span> take(B1 b);   <span class="c">// 按值：对象切片</span>
+D d;
+take(d);           <span class="c">// 只拷贝 B1 子对象，vptr 被设成 B1 的 vtable</span>
+                   <span class="c">// 函数里调用 f() 进的是 B1::f，D::f 永久丢失</span></code></pre>
+    <p><strong>追问：</strong>为什么空基类优化（EBO）在多继承下可能失效？—— 两个空基类若类型相同会要求不同地址，编译器只能各塞 1 字节；<code>[[no_unique_address]]</code>（C++20）可缓解。</p>
+
+    <h2 id="c">C 语言深水区</h2>
+    <div class="box">
+      <span class="box-title">面试官会问</span>
+      <ul>
+        <li>把数组传给函数后 <code>sizeof</code> 为什么变了？</li>
+        <li><code>volatile</code> 到底保证什么、不保证什么？</li>
+        <li><code>restrict</code> 和 <code>const</code> 是给谁的承诺？</li>
+      </ul>
+    </div>
+
+    <h3 id="array-decay">数组退化与 sizeof</h3>
+    <pre><code><span class="k">void</span> f(<span class="k">int</span> a[<span class="n">10</span>]) { <span class="c">/* sizeof(a) == 8，它是指针 */</span> }
+<span class="k">int</span> a[<span class="n">10</span>];
+<span class="c">// sizeof(a) == 40 (int=4)；但 &amp;a + 1 前进 40 字节，a + 1 前进 4 字节</span></code></pre>
+    <p>
+      数组在两个地方不退化：<code>sizeof</code> 和取地址 <code>&amp;a</code>（类型是 <code>int(*)[10]</code>）。
+      其余场合一律退化成指向首元素的指针。<code>void f(int a[10])</code> 里的 <code>10</code> 完全被忽略。
+    </p>
+    <p>正确做法是传数组引用，让编译器保住长度：</p>
+    <pre><code><span class="k">template</span>&lt;<span class="k">size_t</span> N&gt; <span class="k">void</span> f(<span class="k">int</span> (&amp;a)[N]) { <span class="c">/* sizeof(a) == N*4 */</span> }</code></pre>
+    <p><strong>追问：</strong><code>char s[] = "abc"</code> 占几字节？—— 4，含结尾 <code>'\0'</code>；<code>strlen(s)</code> 是 3。</p>
+
+    <h3 id="const-static">const 的位置与 static 的三种含义</h3>
+    <p>读 <code>const</code> 从右往左读，<code>const</code> 修饰它左边最近的类型（左边没有则修饰右边）：</p>
+    <pre><code><span class="k">const</span> <span class="k">char</span> *p;        <span class="c">// 指向 const char 的指针：不能改 *p，能改 p</span>
+<span class="k">char</span> * <span class="k">const</span> p;        <span class="c">// const 指针：能改 *p，不能改 p</span>
+<span class="k">const</span> <span class="k">char</span> * <span class="k">const</span> p;  <span class="c">// 两者都不能改</span></code></pre>
+    <p>
+      <code>static</code> 在三种位置含义完全不同：<strong>局部变量</strong>——静态存储期，只初始化一次，非线程安全（C++11 的 magic static 例外）；
+      <strong>全局变量/函数</strong>——内部链接，符号不导出；<strong>类成员</strong>——属于类而非对象，C++17 起可 <code>inline static</code> 在头文件里定义。
+    </p>
+    <p><strong>追问：</strong>函数里的 <code>static</code> 局部变量在多线程下初始化是线程安全的吗？—— C++11 起是（<code>__cxa_guard_acquire</code>），C 不是。</p>
+
+    <h3 id="volatile">volatile 的边界</h3>
+    <p>
+      <code>volatile</code> 只保证两件事：<strong>编译器不会把访问删掉、不会合并或重排 volatile 访问之间的相对顺序</strong>。
+      它<strong>不保证原子性，也不产生任何 CPU 内存屏障</strong>。
+    </p>
+    <pre><code><span class="k">volatile</span> <span class="k">int</span> counter;
+counter++;          <span class="c">// 读-改-写三步，不是原子的</span>
+
+<span class="c">// 两个线程各执行 100 万次，结果通常远小于 200 万</span></code></pre>
+    <p>它的正当用途只有三类：寄存器映射 I/O、<code>sig_atomic_t</code> 标志位、<code>setjmp</code> 之后可能被修改的局部变量。多线程同步用 <code>std::atomic</code>。</p>
+    <p>
+      在软件里把 DMA 描述符声明成 <code>volatile</code> 是常见错误：它既挡不住 CPU 乱序，也挡不住编译器把它和相邻字段重排；
+      正确做法是驱动里用 <code>READ_ONCE</code>/<code>WRITE_ONCE</code> 加显式屏障，或者走 DMA API 的 <code>dma_wmb()</code>。
+    </p>
+    <p><strong>追问：</strong>既然 <code>volatile</code> 会阻止优化，为什么还要专门写它？—— 因为"防止优化"在这里是<em>需求</em>：设备寄存器的值可能在两次读之间被硬件改变，编译器若把它缓存进寄存器就丢了一次采样。它约束的只是这一个对象。</p>
+
+    <h3 id="bit-tricks">位运算与函数指针</h3>
+    <pre><code>x &amp; (x - <span class="n">1</span>)        <span class="c">// 清掉最低位的 1</span>
+x &amp; (x - <span class="n">1</span>) == <span class="n">0</span> &amp;&amp; x  <span class="c">// x 是 2 的幂（x &gt; 0）</span>
+x &amp; -x             <span class="c">// 只保留最低位的 1（lowbit）</span>
+x | (x + <span class="n">1</span>)        <span class="c">// 把最低位的 0 置 1</span>
+__builtin_popcount(x)   <span class="c">// 置位数，映射到 popcnt</span>
+__builtin_ctz(x)        <span class="c">// 末尾 0 的个数，x != 0</span></code></pre>
+    <p>
+      坑在<strong>有符号类型</strong>：<code>x &amp; -x</code> 当 <code>x == INT_MIN</code> 时，<code>-x</code> 不可表示，是有符号溢出（UB）；
+      <code>x &amp; (x-1)</code> 对负数也依赖补码表示。所以这些技巧要么从一开始就用 <code>unsigned</code>，
+      要么先转成对应的无符号类型再算，最后按需转回。C23 起才强制补码，别依赖更早的方言。
+    </p>
+    <pre><code><span class="k">typedef</span> <span class="k">int</span> (*handler_fn)(<span class="k">void</span> *ctx);
+handler_fn table[<span class="n">4</span>] = { on_a, on_b, on_c, on_d };
+table[op](ctx);                 <span class="c">// 分发表，替代 switch</span></code></pre>
+    <p><strong>追问：</strong>函数指针和 <code>void*</code> 能互相转换吗？—— 严格说不行（哈佛架构），POSIX 保证可以，<code>dlsym</code> 必须靠 <code>*(void**)(&amp;fn) = dlsym(...)</code> 消警告。</p>
+
+    <h3 id="restrict-setjmp">restrict 与 setjmp/longjmp</h3>
+    <p>
+      <code>restrict</code> 是给编译器的<strong>承诺</strong>：该指针是访问其所指对象的唯一途径。编译器据此消除冗余 load，
+      向量化循环。它<strong>不检查，违约即 UB</strong>。
+    </p>
+    <pre><code><span class="k">void</span> copy(<span class="k">int</span> *<span class="k">restrict</span> d, <span class="k">const</span> <span class="k">int</span> *<span class="k">restrict</span> s, <span class="k">int</span> n) {
+    <span class="k">for</span> (<span class="k">int</span> i = <span class="n">0</span>; i &lt; n; i++) d[i] = s[i];
+}
+<span class="k">int</span> a[<span class="n">10</span>] = {<span class="n">1</span>,<span class="n">2</span>,<span class="n">3</span>,<span class="n">4</span>,<span class="n">5</span>,<span class="n">6</span>,<span class="n">7</span>,<span class="n">8</span>,<span class="n">9</span>,<span class="n">10</span>};
+copy(a + <span class="n">1</span>, a, <span class="n">9</span>);   <span class="c">// 区域重叠，违反 restrict 契约 → UB</span>
+<span class="c">// -O2 会向量化：先读一整块再写，结果与逐个 memmove 不同</span></code></pre>
+    <p>
+      这里的关键是"结果<strong>不同</strong>"而不是"崩溃"。如果确实需要重叠拷贝，用 <code>memmove</code>，
+      它明确允许重叠，且实现会按方向选择正/反向遍历。
+    </p>
+    <p>
+      <code>setjmp/longjmp</code> 跳过栈展开：<strong>不调用析构函数</strong>，不释放 RAII 资源。
+      只适合 C 风格的错误退出路径。C++ 里用异常或 <code>std::expected</code>。
+      <code>longjmp</code> 之后，非 volatile 的局部变量值不确定——这就是 <code>volatile</code> 的第二个正当用途。
+    </p>
+    <p><strong>追问：</strong><code>setjmp</code> 之后能调 <code>longjmp</code> 跨越的帧里有什么限制？—— 不能跨过带析构函数的帧，不能跨越线程，且信号处理里只能用 <code>siglongjmp</code> 配 <code>sigsetjmp</code>。</p>
+
+    <h2 id="ub">未定义行为（重点）</h2>
+    <div class="box warn">
+      <span class="box-title">一句话定义</span>
+      UB 不是"结果随机"，而是<strong>编译器可以假设它永远不会发生</strong>，并据此删除、重排、推导你的代码。
+      "能跑"和"正确"是两件不同的事。
+    </div>
+
+    <h3 id="ub-list">必须背下来的几类</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>类别</th><th>例子</th><th>后果</th></tr></thead>
+        <tbody>
+          <tr><td>有符号溢出</td><td><code>INT_MAX + 1</code></td><td>UB；无符号是定义良好的回绕</td></tr>
+          <tr><td>移位越界</td><td><code>1 &lt;&lt; 32</code>（int 32 位）</td><td>UB；负数左移也 UB</td></tr>
+          <tr><td>空指针解引用</td><td><code>*(int*)0</code></td><td>UB，不必崩溃</td></tr>
+          <tr><td>越界访问</td><td><code>a[n]</code></td><td>UB，哪怕下标只差 1</td></tr>
+          <tr><td>严格别名</td><td>用 <code>int*</code> 读 <code>float</code></td><td>UB，编译器可能重排</td></tr>
+          <tr><td>未初始化读</td><td><code>int x; return x;</code></td><td>UB（不确定值）</td></tr>
+          <tr><td>序列点</td><td><code>i = i++;</code></td><td>UB：自增的写与赋值的写之间没有顺序</td></tr>
+          <tr><td>修改字符串字面量</td><td><code>char *s = "abc"; s[0]='x';</code></td><td>字面量位于 <code>.rodata</code>，写它是 UB</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <code>i = i++</code> 的细节值得说准：C++17 规定赋值号右侧先于左侧求值，但<strong>自增的副作用与赋值本身的副作用之间仍然没有顺序</strong>——
+      对同一个标量对象的两个未排序写，依旧是 UB。不要记成"17 之后就安全了"。写成 <code>i = i + 1</code> 或 <code>++i</code>。
+    </p>
+    <p>
+      字符串字面量在 C++11 起类型是 <code>const char[N]</code>，<code>char *s = "abc"</code> 本身就已非良构（现代编译器会报警，
+      <code>-pedantic-errors</code> 下直接报错）。即便用 <code>const_cast</code> 绕过，写 <code>.rodata</code> 仍是 UB，不是"可能崩"。
+    </p>
+    <p><strong>追问：</strong>哪一类最常被误认为"定义良好"？—— <strong>有符号溢出</strong>。很多人在 <code>-fwrapv</code> 或某些老代码里见惯了回绕，但默认编译下它就是 UB，<code>gcc -ftrapv</code> 或 <code>-fsanitize=signed-integer-overflow</code> 才能暴露。</p>
+
+    <h3 id="ub-opt">编译器怎么"利用" UB</h3>
+    <p>因为有符号溢出是 UB，编译器可以推出 <code>x + 1 &gt; x</code> 恒真，于是整段删掉：</p>
+    <pre><code><span class="k">int</span> f(<span class="k">int</span> x) { <span class="k">return</span> x + <span class="n">1</span> &lt; x; }   <span class="c">// -O2 下直接 return 0</span></code></pre>
+    <p>经典的"循环永不结束"：</p>
+    <pre><code><span class="k">void</span> walk(<span class="k">int</span> *p, <span class="k">int</span> n) {
+    <span class="k">for</span> (<span class="k">int</span> i = <span class="n">0</span>; i &lt;= n; i++) p[i] = <span class="n">0</span>;
+}
+<span class="c">// n == INT_MAX 时 i++ 溢出是 UB，编译器可假设循环能终止</span></code></pre>
+    <p>另一个真实事故：<code>memset</code> 被当成死存储删掉，密钥没被清零。</p>
+    <pre><code><span class="k">void</span> wipe(<span class="k">void</span> *key, <span class="k">size_t</span> n) {
+    memset(key, <span class="n">0</span>, n);
+    free(key);          <span class="c">// 编译器：这块内存马上释放，清零无副作用</span>
+}
+<span class="c">// 修法：volatile 写、memset_explicit（C23）、explicit_bzero</span></code></pre>
+    <p><strong>追问：</strong>这算不算编译器 bug？—— 不算。标准明确把"对不可达路径的推导"授权给编译器，责任在代码。</p>
+
+    <h3 id="alias">严格别名与绕过</h3>
+    <p>
+      C/C++ 规定：只有以下几类左值能访问某个对象——相同类型、带 cv 限定的版本、符号/无符号对应版本、
+      聚合体或联合体包含该成员、<code>char</code>/<code>std::byte</code>。
+      把 <code>float</code> 用 <code>int*</code> 去读，违反规则，编译器可以认为两次写不相关。
+    </p>
+    <pre><code><span class="k">float</span> inv(<span class="k">int</span> *x, <span class="k">float</span> *y) {
+    *x = <span class="n">1</span>;
+    <span class="k">return</span> *y;      <span class="c">// 若 x == (int*)y，编译器仍可能把 *y 读提前</span>
+}</code></pre>
+    <p>正确做法：</p>
+    <pre><code><span class="c">// 1. memcpy —— 编译器认得，通常生成一条 mov</span>
+<span class="k">uint32_t</span> bits; memcpy(&amp;bits, &amp;f, <span class="n">4</span>);
+<span class="c">// 2. C++20 std::bit_cast（要求 sizeof 相同、可平凡复制）</span>
+<span class="k">auto</span> bits2 = std::bit_cast&lt;<span class="k">uint32_t</span>&gt;(f);
+<span class="c">// 3. 类型标注 may_alias（GCC/Clang）</span>
+<span class="k">typedef</span> <span class="k">int</span> __attribute__((may_alias)) alias_int;</code></pre>
+    <p>
+      Linux 内核编译时带 <code>-fno-strict-aliasing</code>，正是因为内核里大量用联合体和类型双关访问设备寄存器/描述符，
+      逐个改成 <code>memcpy</code> 不现实。用户态代码<strong>不应该</strong>照抄这个选项——它是放弃优化的权宜之计。
+    </p>
+    <p><strong>追问：</strong><code>char*</code> 为什么是特例？—— 标准允许通过 <code>char*</code> 检查任意对象的字节表示，<code>memcpy</code> 的底层就依赖这一点。</p>
+
+    <h3 id="kbars">READ_ONCE / WRITE_ONCE 为什么存在</h3>
+    <p>它们解决的是<strong>编译器层面</strong>的问题，不是 CPU 内存序的问题：</p>
+    <ul>
+      <li>防止编译器把一次 8 字节访问拆成两次 4 字节（撕裂）；</li>
+      <li>防止合并、消除、或用旧值缓存（"load fusing"）；</li>
+      <li>强制每个源码访问对应一次真实访存。</li>
+    </ul>
+    <pre><code><span class="c">// 内核近似实现（简化）</span>
+<span class="k">#define</span> READ_ONCE(x) (*(<span class="k">volatile</span> <span class="k">typeof</span>(x) *)&amp;(x))
+<span class="k">#define</span> WRITE_ONCE(x, v) (*(<span class="k">volatile</span> <span class="k">typeof</span>(x) *)&amp;(x) = (v))</code></pre>
+    <p>
+      它们<strong>不提供</strong> SMP 下的顺序保证。跨 CPU 的可见性仍然要配 <code>smp_rmb()</code>/<code>smp_wmb()</code>
+      或 acquire/release 语义。这就是为什么内核里经常是 <code>WRITE_ONCE(flag, 1); smp_wmb();</code> 成对出现。
+    </p>
+    <p><strong>追问：</strong>既然 <code>volatile</code> 就能解决，为什么不直接用？—— <code>volatile</code> 粒度太粗，会绑死所有优化，且对结构体成员、位域不方便；<code>READ_ONCE</code> 提供了精确语义和类型检查。</p>
+
+    <h3 id="sanitizer">怎么抓这些 bug</h3>
+    <pre><code>-fsanitize=undefined        <span class="c"># UBSan：溢出、移位、空指针、对齐</span>
+-fsanitize=address          <span class="c"># ASan：越界、UAF、栈溢出</span>
+-fsanitize=thread           <span class="c"># TSan：数据竞争</span>
+-fsanitize=memory           <span class="c"># MSan：未初始化读</span>
+-fno-sanitize-recover=all   <span class="c"># 遇到即 abort，别让 CI 静默通过</span></code></pre>
+    <p>
+      ASan/TSan 不能同时开。UBSan 开销小（约 20%），适合直接进 CI；TSan 有 5~15 倍开销，只在专门的 job 里跑。
+      驱动代码进不了 sanitizer 的部分，靠 KASAN/KCSAN 和静态分析。
+    </p>
+    <p><strong>追问：</strong>为什么 TSan 能抓到数据竞争却抓不到所有内存序错误？—— 它检测的是缺少 happens-before 的冲突访问；而 relaxed 序下逻辑层面的可见性顺序错误，需要模型检查工具。</p>
+
+    <h2 id="modern">现代 C++ 的关键语义</h2>
+    <div class="box">
+      <span class="box-title">面试官会问</span>
+      <ul>
+        <li><code>std::move</code> 到底做了什么？为什么它本身不移动任何东西？</li>
+        <li>为什么移动构造函数要标 <code>noexcept</code>？</li>
+        <li><code>shared_ptr</code> 和 <code>unique_ptr</code> 各占几个字节？</li>
+        <li><code>string_view</code> 什么时候会挂？</li>
+      </ul>
+    </div>
+
+    <h3 id="move">移动语义：move 只是 cast</h3>
+    <p><code>std::move</code> 的实现就是一次 <code>static_cast</code>，不产生任何指令：</p>
+    <pre><code><span class="k">template</span>&lt;<span class="k">class</span> T&gt;
+<span class="k">constexpr</span> std::remove_reference_t&lt;T&gt;&amp;&amp; move(T&amp;&amp; t) <span class="k">noexcept</span> {
+    <span class="k">return</span> <span class="k">static_cast</span>&lt;std::remove_reference_t&lt;T&gt;&amp;&amp;&gt;(t);
+}</code></pre>
+    <p>
+      它把表达式变成 xvalue，从而让重载决议选中 <code>T(T&amp;&amp;)</code>。真正搬运资源的是<strong>移动构造函数</strong>。
+      如果类型没定义移动构造，<code>std::move</code> 之后仍会调拷贝构造——代码照常编译，只是白写。
+    </p>
+    <p>被移动后的对象处于"有效但未指定"状态：可以析构、可以赋值，但别假设它为空。</p>
+    <p><strong>追问：</strong><code>const std::string s; auto t = std::move(s);</code> 会移动吗？—— 不会，<code>const T&amp;&amp;</code> 绑不到 <code>T&amp;&amp;</code>，走拷贝。这是"const 挡移动"的经典坑。</p>
+
+    <h3 id="noexcept">noexcept 与 vector 扩容</h3>
+    <p>
+      <code>vector</code> 扩容时要把旧元素搬到新缓冲区，而它<strong>必须提供强异常保证</strong>：
+      任一步抛异常，原容器必须保持原样。<code>move_if_noexcept</code> 的规则是：
+    </p>
+    <ul>
+      <li>移动构造是 <code>noexcept</code> → 移动；</li>
+      <li>否则若可拷贝 → 拷贝（因为拷贝失败时源对象还在）；</li>
+      <li>否则（只能移动）→ 移动，放弃强保证。</li>
+    </ul>
+    <pre><code><span class="k">struct</span> S {
+    S(S&amp;&amp;) <span class="k">noexcept</span> = <span class="k">default</span>;
+    <span class="c">// 漏了 noexcept：vector&lt;S&gt; 扩容会走拷贝</span>
+};</code></pre>
+    <p>这条规则的代价很实在：一次扩容从 N 次指针搬运变成 N 次深拷贝。<strong>移动构造、移动赋值、析构默认都该是 <code>noexcept</code></strong>。</p>
+    <p><strong>追问：</strong>移动构造标了 <code>noexcept</code> 但内部真抛了会怎样？—— 直接 <code>std::terminate</code>，异常不会传播出去。</p>
+
+    <h3 id="smartptr">智能指针的尺寸与开销</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>类型</th><th>sizeof（x86-64）</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>unique_ptr&lt;T&gt;</code></td><td>8</td><td>默认 deleter 空类，经 EBO 压成 0</td></tr>
+          <tr><td><code>unique_ptr&lt;T, void(*)(T*)&gt;</code></td><td>16</td><td>函数指针 deleter 占 8</td></tr>
+          <tr><td><code>unique_ptr&lt;T, D&gt;</code>（D 有状态）</td><td>8 + sizeof(D)</td><td>带捕获的 lambda 会撑大</td></tr>
+          <tr><td><code>shared_ptr&lt;T&gt;</code></td><td>16</td><td>对象指针 + 控制块指针</td></tr>
+          <tr><td><code>weak_ptr&lt;T&gt;</code></td><td>16</td><td>同上，指向同一控制块</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <code>shared_ptr</code> 的控制块含强计数、弱计数、deleter、allocator。默认 <code>shared_ptr&lt;T&gt;(new T)</code>
+      是<strong>两次分配</strong>（对象 + 控制块），而 <code>make_shared&lt;T&gt;()</code> 合成一次分配，
+      代价是弱引用全部消失前对象的内存也不能归还（控制块和对象在同一块里）。
+    </p>
+    <p>
+      循环引用靠 <code>weak_ptr</code> 打破：<code>weak_ptr::lock()</code> 会原子地检查强计数是否为零并临时提升为 <code>shared_ptr</code>。
+      <code>enable_shared_from_this</code> 要求对象<strong>已经被 shared_ptr 管理</strong>，在栈对象上调用会抛 <code>bad_weak_ptr</code>。
+    </p>
+    <p><strong>追问：</strong>为什么 <code>shared_ptr</code> 不把计数放在对象里？—— 支持别名构造（aliasing constructor）、指向子对象、以及对象与计数生命周期解耦。</p>
+
+    <h3 id="lambda-view">lambda 与 view 的坑</h3>
+    <p>lambda 是一个<strong>匿名类</strong>，捕获列表就是它的成员，<code>operator()</code> 默认 <code>const</code>：</p>
+    <pre><code><span class="k">int</span> x = <span class="n">1</span>;
+<span class="k">auto</span> f = [x]() <span class="k">mutable</span> { <span class="k">return</span> ++x; };  <span class="c">// 拷贝进来，改的是副本</span>
+<span class="k">auto</span> g = [&amp;x]() { <span class="k">return</span> ++x; };        <span class="c">// 引用，注意生命周期</span>
+<span class="k">auto</span> h = [p = std::make_unique&lt;T&gt;()]{};    <span class="c">// init capture，C++14</span></code></pre>
+    <p>
+      捕获 <code>this</code> 的 lambda 实质上捕获了裸指针。<code>[=]</code> 也不会延长成员的生命周期；
+      在异步回调里捕获 <code>this</code> 是最常见的 UAF 来源。C++17 用 <code>[*this]</code> 明确按值拷贝对象。
+    </p>
+    <pre><code>std::string_view sv = std::string(<span class="s">"hello"</span>);  <span class="c">// 立即悬垂</span>
+<span class="c">// sv.data() 指向临时对象释放后的内存，读它是 UB</span></code></pre>
+    <p>
+      <code>string_view</code> 只是一个 <code>{const char*, size_t}</code>，<strong>不拥有内存、不保证 <code>'\0'</code> 结尾</strong>。
+      把它当参数类型很好（零拷贝），当成员或返回值要极其小心。
+      <code>span</code> 同理：引用语义，不延长生命周期。
+    </p>
+    <p><strong>追问：</strong><code>optional&lt;T&gt;</code> 的 <code>value()</code> 和 <code>*</code> 有什么区别？—— <code>value()</code> 空时抛 <code>bad_optional_access</code>，<code>*</code> 空时是 UB。</p>
+
+    <h2 id="concurrency">C++ 内存模型（重点）</h2>
+    <div class="box warn">
+      <span class="box-title">为什么 GPU 岗要考这个</span>
+      CUDA 的 <code>__threadfence()</code>、PTX 的 <code>.acquire</code>/<code>.release</code>、
+      以及 GPU 与 CPU 之间的一致性，全部建立在这套模型上。答不出 release-acquire 的配对条件，就无法解释为什么
+      <code>cudaMemcpy</code> 之后的可见性需要什么同步。
+    </div>
+
+    <h3 id="hb">三个基础关系</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>关系</th><th>范围</th><th>定义</th></tr></thead>
+        <tbody>
+          <tr><td>sequenced-before</td><td>同一线程</td><td>语句/求值之间的先后（含全序和部分序）</td></tr>
+          <tr><td>synchronizes-with</td><td>跨线程</td><td>release 写 → acquire 读，且读到了这次写的值（或 release sequence 里的值）</td></tr>
+          <tr><td>happens-before</td><td>传递闭包</td><td>sequenced-before ∪ synchronizes-with 的传递闭包</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      数据竞争的定义：两个线程访问同一内存位置、至少一个写、且两者之间没有 happens-before 关系 → <strong>UB</strong>。
+      注意这里的"竞争"是数学定义，不是"结果看起来不对"。
+    </p>
+    <p><strong>追问：</strong>release-acquire 之后，普通非原子变量也可见吗？—— 是。这正是它的价值：<code>data = 42; flag.store(1, release);</code> 中 <code>data</code> 的写会被"携带"过去。</p>
+
+    <h3 id="orders">六种 memory_order</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>order</th><th>能用于</th><th>保证</th><th>x86 实际代价</th></tr></thead>
+        <tbody>
+          <tr><td><code>relaxed</code></td><td>load/store/RMW</td><td>仅原子性，不建立任何顺序</td><td>普通 mov</td></tr>
+          <tr><td><code>consume</code></td><td>load</td><td>仅对<strong>数据依赖</strong>成立（依赖链）</td><td>无（实际被当作 acquire）</td></tr>
+          <tr><td><code>acquire</code></td><td>load/RMW</td><td>后续读写不能排到它前面</td><td>普通 mov</td></tr>
+          <tr><td><code>release</code></td><td>store/RMW</td><td>之前的读写不能排到它后面</td><td>普通 mov</td></tr>
+          <tr><td><code>acq_rel</code></td><td>RMW</td><td>读部分 acquire，写部分 release</td><td>lock 前缀</td></tr>
+          <tr><td><code>seq_cst</code></td><td>全部</td><td>在以上基础上，所有 seq_cst 操作有<strong>唯一全序</strong></td><td>store 需 <code>xchg</code> 或 mfence</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <code>consume</code> 在标准里被标注为"不推荐"，因为主流编译器无法有效实现依赖链跟踪，实际都退化成 <code>acquire</code>。
+      面试时能说出这一点，比背定义有说服力。
+    </p>
+    <p>
+      x86 是 TSO 模型：load-load、load-store、store-store 都不重排，只有 store-load 会。
+      所以 acquire 和 release 在 x86 上都是免费的（普通 mov），<strong>只有 seq_cst store 需要额外代价</strong>（<code>xchg</code> 隐含 lock，约 20~30 cycle）。
+      ARM 是弱模型，acquire/release 会变成 <code>ldar</code>/<code>stlr</code>。
+    </p>
+    <p><strong>追问：</strong>那在 x86 上只用 relaxed 是不是也没问题？—— 不行。编译器仍可跨线程重排，而且代码要可移植到 ARM（GPU 驱动必然要）。</p>
+
+    <h3 id="ra">release-acquire 配对规则</h3>
+    <pre><code>std::atomic&lt;<span class="k">bool</span>&gt; ready{<span class="k">false</span>};
+<span class="k">int</span> data = <span class="n">0</span>;
+
+<span class="c">// 线程 1</span>
+data = <span class="n">42</span>;
+ready.store(<span class="k">true</span>, std::memory_order_release);
+
+<span class="c">// 线程 2</span>
+<span class="k">while</span> (!ready.load(std::memory_order_acquire)) {}
+assert(data == <span class="n">42</span>);   <span class="c">// 一定成立</span></code></pre>
+    <p>配对成立需要三个条件同时满足：</p>
+    <ol>
+      <li>写操作是 <code>release</code>（或更强的 <code>seq_cst</code>）；</li>
+      <li>读操作是 <code>acquire</code>（或更强）；</li>
+      <li>读<strong>读到了</strong>那次写的值——包括 release sequence（同一原子变量上的后续 RMW 链）和 RMW 原子操作。</li>
+    </ol>
+    <p>
+      常见错误是把 <code>acquire</code> 写成 <code>relaxed</code>，或者对不同的原子变量配对。
+      acquire 必须"看见"那次 release，跨变量的配对不成立。
+    </p>
+    <p><strong>追问：</strong><code>acquire</code> 的 load 和后面的非原子读之间需要额外的 fence 吗？—— 不需要，acquire 语义覆盖了后续所有读写。</p>
+
+    <h3 id="spinlock">用 atomic 写自旋锁与引用计数</h3>
+    <pre><code><span class="k">class</span> Spinlock {
+    std::atomic&lt;<span class="k">bool</span>&gt; locked_{<span class="k">false</span>};
+<span class="k">public</span>:
+    <span class="k">void</span> lock() {
+        <span class="k">while</span> (locked_.exchange(<span class="k">true</span>, std::memory_order_acquire))
+            <span class="k">while</span> (locked_.load(std::memory_order_relaxed))
+                __builtin_ia32_pause();     <span class="c">// 退避，别把总线打满</span>
+    }
+    <span class="k">void</span> unlock() {
+        locked_.store(<span class="k">false</span>, std::memory_order_release);
+    }
+};</code></pre>
+    <p>
+      关键点在两个 order：<strong>加锁用 acquire（或 acq_rel），解锁用 release</strong>。
+      内层 <code>relaxed</code> 的自旋是优化——真正的同步由成功的那次 exchange 提供。
+      <code>pause</code> 指令让超线程让出流水线，同时降低缓存一致性流量。
+    </p>
+    <pre><code><span class="c">// 引用计数：常见的正确实现骨架</span>
+<span class="k">if</span> (n.fetch_sub(<span class="n">1</span>, std::memory_order_acq_rel) == <span class="n">1</span>)
+    <span class="k">delete</span> this;
+<span class="c">// 增加计数用 relaxed 即可，但必须保证对象还活着</span>
+n.fetch_add(<span class="n">1</span>, std::memory_order_relaxed);</code></pre>
+    <p>
+      为什么减计数必须是 <code>acq_rel</code>（或等价的 release 减 + acquire fence）：
+      <strong>release 部分</strong>保证本线程在此之前对对象的写，对"最后负责销毁的那个线程"可见；
+      <strong>acquire 部分</strong>保证最后这个线程能看到其他所有持有者在减计数之前的写。
+      缺少 release 会漏掉自己的写，缺少 acquire 会看不到别人的写。
+      两个等价写法只选一种，不要叠加：
+    </p>
+    <pre><code><span class="c">// 写法 B：relaxed 减 + fence，常用于避免 RMW 的 acq_rel 开销</span>
+<span class="k">if</span> (n.fetch_sub(<span class="n">1</span>, std::memory_order_relaxed) == <span class="n">1</span>) {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    <span class="k">delete</span> this;
+}</code></pre>
+    <p><strong>追问：</strong>为什么增计数可以用 relaxed？—— 因为持有者已经存在，对象不会被销毁；增计数不需要与任何写建立顺序。但前提是"已经持有引用"这件事本身有同步保证。</p>
+
+    <h3 id="seqcst-dekker">seq_cst 与 Dekker 的经典反例</h3>
+    <p>两个线程各写自己的标志、各读对方的标志，经典 Dekker 算法，用 relaxed 会<strong>两个读都看到 0</strong>：</p>
+    <pre><code>std::atomic&lt;<span class="k">int</span>&gt; x{<span class="n">0</span>}, y{<span class="n">0</span>};
+<span class="k">int</span> rx = <span class="n">0</span>, ry = <span class="n">0</span>;
+<span class="c">// 线程 1</span>  x.store(<span class="n">1</span>, relaxed); rx = y.load(relaxed);
+<span class="c">// 线程 2</span>  y.store(<span class="n">1</span>, relaxed); ry = x.load(relaxed);
+<span class="c">// 允许 rx == 0 &amp;&amp; ry == 0（store-load 重排）</span></code></pre>
+    <p>
+      换成 <code>seq_cst</code> 后，所有 seq_cst 操作共享一个全序，上述结果不可能出现。
+      这正是"唯一全序"的实际含义：它禁止了跨线程的 store-load 重排。
+      x86 上因为 TSO 已经禁止 store-load 重排，所以只用普通 load/store 也能跑对——但这是平台特性，不是标准保证。
+    </p>
+    <p><strong>追问：</strong>那为什么不用 <code>seq_cst</code> 一把梭？—— 每条 seq_cst store 在 x86 上都是一次 <code>lock</code> 前缀，热点路径上代价可观；而且它建立的是全局顺序，比实际需要的强得多。</p>
+
+    <h3 id="atomic-flag">atomic_flag 与 is_lock_free</h3>
+    <pre><code>std::atomic_flag f = ATOMIC_FLAG_INIT;   <span class="c">// C++20 起可默认初始化</span>
+f.test_and_set(std::memory_order_acquire);
+f.clear(std::memory_order_release);</code></pre>
+    <p>
+      <code>atomic_flag</code> 是标准里唯一<strong>保证</strong> lock-free 的原子类型，通常就是一条 <code>xchg</code>。
+      <code>atomic&lt;T&gt;::is_lock_free()</code> 是运行时查询：x86-64 上 8 字节以内为 true；
+      16 字节取决于 CPU 是否有 <code>cmpxchg16b</code>；带 mutex 的退化实现不是 lock-free。
+    </p>
+    <p>
+      还有一个容易忽略的点：<code>std::atomic&lt;T&gt;</code> 不可拷贝、不可移动，
+      而且 C++20 之前默认构造<strong>不初始化</strong>（值不确定）。全局/静态的 <code>atomic</code> 会被零初始化，栈上的不会。
+    </p>
+    <p><strong>追问：</strong><code>atomic&lt;double&gt;</code> 是 lock-free 吗？—— 在 x86-64 上通常是。<code>load</code>/<code>store</code>/<code>exchange</code>/<code>compare_exchange</code> 对 8 字节浮点没有硬件障碍，实现用整数 CAS 处理位模式；<code>is_lock_free()</code> 报 true。真正需要注意的反而是<strong>语义</strong>：浮点没有 <code>fetch_add</code>（C++20 才有 <code>fetch_add</code> 的浮点特化），且 <code>atomic&lt;double&gt;</code> 的单位是"位模式"而不是数值，<code>-0.0</code>/<code>NaN</code> 的比较行为要小心。</p>
+
+    <h2 id="abi">ABI、链接与工程</h2>
+    <div class="box">
+      <span class="box-title">面试官会问</span>
+      <ul>
+        <li><code>extern "C"</code> 解决了什么问题？</li>
+        <li>为什么共享库一定要 <code>-fPIC</code>？</li>
+        <li>两个 GCC 版本编出来的库为什么链接失败或运行时崩溃？</li>
+      </ul>
+    </div>
+
+    <h3 id="extern-c">name mangling 与 extern "C"</h3>
+    <pre><code><span class="c">// C++ 源码</span>
+<span class="k">namespace</span> drv { <span class="k">int</span> submit(<span class="k">int</span>, <span class="k">char</span>*); }
+<span class="c">// 符号：_ZN3drv6submitEiPc</span>
+
+<span class="k">extern</span> <span class="s">"C"</span> <span class="k">int</span> drv_submit(<span class="k">int</span>, <span class="k">char</span>*);
+<span class="c">// 符号：drv_submit（无修饰）</span></code></pre>
+    <p>
+      <code>extern "C"</code> 只影响<strong>符号名和调用约定</strong>，不影响语言特性。
+      它必须和 C 头文件里的声明完全一致，否则链接期才报错。
+      驱动里对 <code>dlsym</code> 查找的入口函数、以及给 C 程序用的 UAPI，都必须 <code>extern "C"</code>。
+    </p>
+    <p><strong>追问：</strong>函数重载为什么需要 mangling？—— 因为链接器只认符号名，重载后的多个 <code>f</code> 必须有不同符号。</p>
+
+    <h3 id="link">静态链接、动态链接与 PIC</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>方式</th><th>时机</th><th>优缺点</th></tr></thead>
+        <tbody>
+          <tr><td>静态 <code>.a</code></td><td>链接期复制进可执行文件</td><td>无运行时依赖、启动快；体积大、无法共享、升级要重编</td></tr>
+          <tr><td>动态 <code>.so</code></td><td>运行时 <code>ld.so</code> 加载</td><td>共享内存页、可热更新；需处理符号版本和 ABI</td></tr>
+          <tr><td><code>dlopen</code></td><td>运行时手动</td><td>插件化；<code>RTLD_NOW</code> 立即解析，<code>RTLD_LAZY</code> 首次调用才解析</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <code>-fPIC</code> 让代码不依赖固定加载地址：外部符号通过 GOT 间接访问，函数通过 PLT 跳转。
+      代价是多一次间接寻址，以及占用一个寄存器（x86-64 上 <code>%rip</code> 相对寻址缓解了很多）。
+      共享库<strong>必须</strong> PIC；可执行文件用 <code>-fPIE</code> 以获得 ASLR。
+    </p>
+    <p>
+      <code>-fvisibility=hidden</code> 把默认导出改成隐藏，再用 <code>__attribute__((visibility("default")))</code>
+      显式导出。好处是符号表小、加载快，并让编译器能对内部函数做跨 TU 优化（因为知道它们不会被外部 interpose）。
+    </p>
+    <p><strong>追问：</strong><code>LD_PRELOAD</code> 为什么能劫持 <code>malloc</code>？—— 动态链接器按加载顺序搜索符号，预加载的库排在最前，全局符号优先命中。</p>
+
+    <h3 id="odr">ODR 与单例的线程安全</h3>
+    <p>
+      一个实体在整个程序里只能有一个定义。头文件里定义非 inline 的全局变量会违反 ODR，链接期报 multiple definition。
+      正确写法：
+    </p>
+    <pre><code><span class="k">inline</span> <span class="k">int</span> counter = <span class="n">0</span>;              <span class="c">// C++17：头文件里定义，自动合并</span>
+<span class="k">inline</span> <span class="k">constexpr</span> <span class="k">int</span> kMax = <span class="n">1024</span>;    <span class="c">// 隐式 inline</span></code></pre>
+    <p>局部静态变量的初始化在 C++11 起是线程安全的（"magic static"）：</p>
+    <pre><code>Config&amp; cfg() {
+    <span class="k">static</span> Config c;    <span class="c">// __cxa_guard_acquire/release 保护</span>
+    <span class="k">return</span> c;
+}</code></pre>
+    <p>
+      多数实现把它编译成一个 guard 字节 + <code>__cxa_guard_acquire/release</code>。
+      初始化完成后的稳态路径上只有一次<strong>普通字节 load 加分支</strong>（GCC 实际生成 <code>movzbl</code> / <code>testb</code>），
+      连原子指令都没有——这也是它比手写双检锁更快的原因。
+    </p>
+    <p>
+      但<strong>构造函数内部递归调用 <code>cfg()</code> 会抛 <code>__gnu_cxx::recursive_init_error</code></strong>，
+      也不能在构造期间起线程再回来访问。这两个坑比性能更值得记住。
+    </p>
+    <p><strong>追问：</strong>为什么不用双检锁写单例？—— DCLP 需要 <code>atomic</code> 加正确内存序，写错就是数据竞争；magic static 更简单也更快。</p>
+
+    <h3 id="abi-compat">_GLIBCXX_USE_CXX11_ABI</h3>
+    <p>
+      GCC 5 把 <code>std::string</code> 从写时复制（COW）换成了短字符串优化（SSO），
+      旧实现是"一个指针"，新实现是"指针 + 长度 + 内联缓冲"，<strong><code>sizeof(std::string)</code> 从 8 变成 32</strong>。
+      于是符号名里多了 <code>__cxx11</code> 标记，两套 ABI 不兼容。
+    </p>
+    <pre><code>undefined reference to
+  `foo(std::__cxx11::basic_string&lt;char...&gt; const&amp;)`
+<span class="c">// 而库里导出的是 foo(std::basic_string&lt;char...&gt; const&amp;)</span></code></pre>
+    <p>
+      典型场景：预编译的第三方 <code>.so</code> 用旧 ABI 编，你的代码用新 ABI，链接失败。
+      解法只有统一 ABI 宏或重新编译，<code>-D_GLIBCXX_USE_CXX11_ABI=0</code> 是权宜之计。
+      这也是为什么给驱动程序发行二进制库时，接口尽量<strong>只用 C ABI 和 POD 类型</strong>。
+    </p>
+    <p><strong>追问：</strong>还有哪些常见 ABI 断点？—— <code>std::list</code> 的 size 字段、<code>std::pair</code> 的布局、异常表格式、以及不同 libstdc++/libc++ 混用。</p>
+
+    <h2 id="perf">性能相关</h2>
+    <div class="box">
+      <span class="box-title">面试官会问</span>
+      <ul>
+        <li>什么是伪共享？怎么定位、怎么修？</li>
+        <li><code>asm volatile("" ::: "memory")</code> 和 <code>mfence</code> 有什么区别？</li>
+        <li><code>__builtin_expect</code> 还有用吗？</li>
+      </ul>
+    </div>
+
+    <h3 id="cacheline">cache line 与伪共享</h3>
+    <p>x86-64 的缓存行是 <strong>64 字节</strong>（大多数 ARM 也是，部分是 128 字节）。缓存一致性以行为单位，不是以变量为单位。</p>
+    <pre><code><span class="k">struct</span> Counters {
+    std::atomic&lt;<span class="k">long</span>&gt; a;   <span class="c">// 同一 cache line</span>
+    std::atomic&lt;<span class="k">long</span>&gt; b;
+};
+<span class="c">// 两个线程各写各的，仍然互相让缓存行失效 —— 伪共享</span>
+
+<span class="k">struct</span> <span class="k">alignas</span>(<span class="n">64</span>) Padded {
+    std::atomic&lt;<span class="k">long</span>&gt; a;   <span class="c">// alignas 已保证 sizeof 是 64 的倍数</span>
+};
+<span class="c">// C++17: std::hardware_destructive_interference_size</span></code></pre>
+    <p>
+      定位方法：<code>perf c2c record/report</code>（检测 cache line 争用），或 <code>perf stat -e cache-misses</code> 对比。
+      内核里用 <code>____cacheline_aligned_in_smp</code>。
+    </p>
+    <p>
+      <code>alignas(64)</code> 同时把起始地址对齐到行首、把 <code>sizeof</code> 补齐到 64 的倍数，
+      所以结构体数组的元素之间不会共享行。真正会失效的场景是：把它作为<strong>另一个未对齐结构体的成员</strong>，
+      或者用 C++17 之前不带 over-aligned 支持的 <code>new</code>/<code>malloc</code> 分配——那时对齐承诺不会被兑现。
+      更稳妥的写法是显式给足 padding 并 <code>static_assert(alignof(T) >= 64)</code>。
+    </p>
+    <p><strong>追问：</strong><code>std::hardware_destructive_interference_size</code> 和 <code>hardware_constructive_interference_size</code> 分别是什么？—— 前者是避免伪共享的间距，后者是共享同一行做预取友好的大小。</p>
+
+    <h3 id="layout-perf">数据布局：AoS vs SoA</h3>
+    <pre><code><span class="k">struct</span> Particle { <span class="k">float</span> x, y, z; <span class="k">float</span> vx, vy, vz; };   <span class="c">// AoS</span>
+Particle ps[N];                                      <span class="c">// 每个 24 字节</span>
+
+<span class="k">struct</span> Particles { <span class="k">float</span> x[N], y[N], z[N]; ... };     <span class="c">// SoA</span></code></pre>
+    <p>
+      只更新位置时，AoS 每读一个 <code>x</code> 要把整行 64 字节读进来（浪费 <code>v*</code>），
+      SoA 则是连续访存、天然可向量化。SIMT/SIMD 场景下 SoA 几乎是默认选择。
+      但 SoA 增加了"跨字段联动"的代价，且不利于随机访问单个实体。
+    </p>
+    <p><strong>追问：</strong>驱动里命令缓冲区用哪种？—— 通常按硬件描述符的固定布局（AoS），因为 DMA 引擎要求连续结构；CPU 侧处理则可能转成 SoA。</p>
+
+    <h3 id="barriers">编译器屏障 vs CPU 屏障</h3>
+    <pre><code>asm <span class="k">volatile</span>(<span class="s">""</span> ::: <span class="s">"memory"</span>);         <span class="c">// 只挡编译器重排</span>
+__sync_synchronize();                   <span class="c">// 全屏障，x86 上是 mfence</span>
+std::atomic_thread_fence(seq_cst);      <span class="c">// 同上</span>
+std::atomic_signal_fence(seq_cst);      <span class="c">// 编译器屏障</span>
+__builtin_ia32_pause();                 <span class="c">// 自旋退避</span></code></pre>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>编译期重排</th><th>CPU 乱序</th><th>典型用途</th></tr></thead>
+        <tbody>
+          <tr><td>编译器屏障</td><td>阻止</td><td>不阻止</td><td>防止优化掉或合并访存</td></tr>
+          <tr><td>CPU 屏障</td><td>阻止</td><td>阻止</td><td>真正的跨核可见性</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <code>asm volatile("" ::: "memory")</code> 不生成任何指令，只是告诉编译器"内存变了，别缓存"。
+      在单核与中断上下文之间，它有时够用（因为中断在同核上、CPU 自身是顺序的）；
+      <strong>跨核通信必须用真正的 CPU 屏障</strong>。
+    </p>
+    <p><strong>追问：</strong>为什么 <code>volatile</code> 不能替代屏障？—— 它只约束编译器对这一个对象的访问，不约束其它访存，也不发 CPU 指令。</p>
+
+    <h3 id="inline-branch">内联、分支与 constexpr</h3>
+    <p>
+      <code>inline</code> 是建议不是命令。真正决定内联的是成本模型和 <code>-O2/-O3</code>；
+      <code>-O3</code> 会开更激进的向量化和内联，可能让代码膨胀、icache 抖动，芯片热点函数上有时反而更慢。
+      <code>-flto</code> 让跨编译单元内联和去虚化成为可能，效果通常比调 <code>-O3</code> 更明显。
+    </p>
+    <pre><code><span class="k">if</span> (__builtin_expect(err != <span class="n">0</span>, <span class="n">0</span>)) { handle(err); }</code></pre>
+    <p>
+      现代编译器在有 PGO 时基本不需要手写 <code>__builtin_expect</code>，而且它只在跳转方向上有用，
+      不解决间接跳转（虚函数、函数指针）的预测问题。
+    </p>
+    <p>
+      <code>constexpr</code> 是编译期求值，<code>consteval</code> 是强制编译期。<code>if constexpr</code> 做编译期分支，
+      替代 SFINAE 和大部分 <code>enable_if</code>。模板元编程的代价是编译时间和代码膨胀，<code>static_assert</code> 是它最好的搭档。
+    </p>
+    <p><strong>追问：</strong><code>constexpr</code> 函数一定在编译期执行吗？—— 不一定，只有在常量表达式语境下才强制编译期求值，否则可以运行时执行。</p>
+
+    <h2 id="qa">高频问答</h2>
+
+    <details class="qa">
+      <summary>一个含虚函数的类的 sizeof 是多少？为什么？</summary>
+      <div class="a">
+        <p>Itanium ABI（Linux GCC/Clang）下，含虚函数的类在对象内嵌一个 <code>vptr</code>，大小等于指针（x86-64 上 8 字节）。</p>
+        <p>所以：空类 <code>sizeof == 1</code>；只有虚函数的类 <code>sizeof == 8</code>；<code>virtual void f(); int x;</code> 是 16（vptr 8 + int 4 + 4 填充）。</p>
+        <p>但这只是常见实现：MSVC 也放一个 vptr，某些嵌入式 ABI 或 fat pointer 方案不同。回答时先说"在 Itanium ABI 下"。</p>
+        <p><strong>追问：</strong>虚继承为什么更大？—— 多一层虚基类偏移的间接，且通常引入虚基类表，布局依继承层次而定，不该背固定值。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>std::move 做了什么？</summary>
+      <div class="a">
+        <p>它只是把左值转成右值引用（xvalue），本质是一次 <code>static_cast&lt;T&amp;&amp;&gt;</code>，不生成任何指令，也不搬任何字节。</p>
+        <p>真正的资源转移发生在被选中的移动构造/移动赋值里。如果类型没有移动操作，<code>std::move</code> 之后仍走拷贝。</p>
+        <p>被移动对象处于"有效但未指定"状态，可以析构、可以重新赋值，不要依赖它的内容。</p>
+        <p><strong>追问：</strong><code>return std::move(local);</code> 为什么是反模式？—— 它会阻止 NRVO（返回值优化），还可能因为 const/引用而退化成拷贝。直接 <code>return local;</code>。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>shared_ptr 是线程安全的吗？</summary>
+      <div class="a">
+        <p><strong>引用计数是线程安全的</strong>：控制块里的强/弱计数用原子操作维护，多个线程各自持有 <code>shared_ptr</code> 副本并析构，不会重复释放。</p>
+        <p><strong>被指向的对象不是</strong>：多线程同时读写 <code>*p</code> 仍需要外部同步。</p>
+        <p><strong>同一个 shared_ptr 实例也不是</strong>：多个线程同时对<em>同一个</em> <code>shared_ptr</code> 变量做赋值/重置是数据竞争（指针和控制块指针不是一个原子整体）。需要 <code>std::atomic&lt;std::shared_ptr&lt;T&gt;&gt;</code>（C++20）或加锁。</p>
+        <p><strong>追问：</strong>为什么 <code>atomic&lt;shared_ptr&gt;</code> 到 C++20 才进标准？—— 需要保证指针与控制块的一致性，通常用 <code>lock cmpxchg16b</code> 或内部锁实现，早期没有可移植做法。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>volatile 能用于多线程同步吗？</summary>
+      <div class="a">
+        <p><strong>不能。</strong>它只保证编译器不优化掉对它的访问、不合并、不重排它与其他 volatile 访问的相对次序；它<strong>不保证原子性，也不发 CPU 内存屏障</strong>。</p>
+        <p>多线程下 <code>volatile int flag</code> 无法保证一个线程的写何时对另一个线程可见，也无法保证其他变量的可见性。</p>
+        <p>正确工具是 <code>std::atomic</code>（需要顺序时选 acquire/release），或者 <code>mutex</code>。</p>
+        <p><strong>追问：</strong>volatile 的合法用途是什么？—— MMIO（设备寄存器）、<code>sig_atomic_t</code> 信号标志、<code>setjmp/longjmp</code> 场景下可能被修改的局部变量。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>什么是严格别名规则？怎么绕过？</summary>
+      <div class="a">
+        <p>标准规定一个对象的存储只能通过以下左值访问：相同类型、带 cv 限定的版本、对应的有符号/无符号类型、包含它的聚合体/联合体的成员、<code>char</code>/<code>std::byte</code>。</p>
+        <p>违反规则是 UB：编译器可以认为 <code>int*</code> 和 <code>float*</code> 指向的对象互不相关，从而重排读写、缓存值。</p>
+        <p>合法绕过：<code>memcpy</code>（编译器通常优化成一条 mov）、C++20 的 <code>std::bit_cast</code>、GCC/Clang 的 <code>__attribute__((may_alias))</code>；或对整个项目用 <code>-fno-strict-aliasing</code>（内核就是这么干的，但那是放弃优化的权宜之计）。</p>
+        <p><strong>追问：</strong>为什么 <code>char*</code> 是特例？—— 标准允许它检视任意对象的字节表示，<code>memcpy</code> 的语义就建立在这上面。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>RAII 怎么保证异常安全？三个级别是什么？</summary>
+      <div class="a">
+        <p>RAII 把资源生命周期绑定到对象生命周期：构造函数获取、析构函数释放。栈展开时析构函数自动调用，所以无论正常返回还是抛异常，资源都会释放。</p>
+        <p>三个保证：</p>
+        <ul>
+          <li><strong>不抛保证（no-throw）</strong>：操作绝不失败，如 <code>swap</code>、<code>unique_ptr</code> 的析构。</li>
+          <li><strong>强保证（strong）</strong>：操作失败时状态完全回滚，像事务一样。典型实现是 copy-and-swap。</li>
+          <li><strong>基本保证（basic）</strong>：失败后没有资源泄漏、对象仍可析构，但状态可能变化。</li>
+        </ul>
+        <p>析构函数绝不能抛异常——若在栈展开中抛出，直接 <code>std::terminate</code>。</p>
+        <p><strong>追问：</strong>vector 扩容为什么能提供强保证？—— 它先在新的缓冲区构造完成，再用 <code>noexcept</code> 的移动（或拷贝）提交；任一步失败就释放新缓冲区，旧数据不动。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>手写一个无锁栈/自旋锁要注意什么？</summary>
+      <div class="a">
+        <p><strong>自旋锁</strong>的要点：加锁用 <code>exchange(acquire)</code>、解锁用 <code>store(release)</code>；内层用 <code>relaxed</code> 读加 <code>pause</code> 退避；注意不能让持锁线程被抢占后再睡眠；绝不能在单核上忙等无 yield。</p>
+        <p><strong>无锁栈</strong>（Treiber stack）的要点：</p>
+        <ul>
+          <li>push 用 <code>compare_exchange_weak</code> 循环，注意 ABA 问题——用带版本号的指针（tagged pointer）或 hazard pointer/epoch 回收。</li>
+          <li><code>compare_exchange</code> 的失败路径期望值会被更新，循环里不要重复初始化。</li>
+          <li>内存回收才是真正的难点：节点出栈后不能立刻 <code>delete</code>，其他线程可能仍在读。</li>
+        </ul>
+        <p><strong>追问：</strong>ABA 为什么会出错？—— CAS 只比较值，如果指针被释放又重分配成同一地址，CAS 会误判"没变化"，把栈接错。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>为什么虚函数调用比普通函数慢？</summary>
+      <div class="a">
+        <p>三层原因：</p>
+        <ol>
+          <li><strong>间接跳转</strong>：<code>call *%rdx</code> 依赖前两次 load（读 vptr、读表项），是串行的三次访存；分支预测器要预测目标地址，猜错约 15~20 cycle。</li>
+          <li><strong>无法内联</strong>：这往往比间接跳转本身更贵——内联之后常量传播、死代码消除、向量化全都做不了。</li>
+          <li><strong>代码局部性差</strong>：目标函数散落在各处，icache 命中率下降。</li>
+        </ol>
+        <p>优化手段：<code>final</code>、把具体类型留在栈上、LTO 去虚化、把热路径改成 <code>switch + 模板</code> 或 CRTP 静态分派。</p>
+        <p><strong>追问：</strong>什么样的虚调用反而"免费"？—— 尾调用（<code>jmp *%rdx</code>）省掉一次返回；以及同一调用点反复命中同一目标时，预测器能学得很好。</p>
+      </div>
+    </details>
+
+    <div class="box ok" style="margin-top:34px">
+      <span class="box-title">下一步</span>
+      去 <a href="../quiz/index.html?cat=cpp">刷 C/C++ 专题</a>。然后读 <a href="python.html">Python</a>。
+    </div>
+  </main>
+</div>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

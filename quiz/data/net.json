@@ -1,0 +1,162 @@
+{
+  "questions": [
+    {
+      "id": "n-001",
+      "q": "TCP 三次握手中，服务端在收到 SYN 后进入哪个状态？",
+      "opts": ["ESTABLISHED", "SYN_RCVD", "LISTEN", "CLOSE_WAIT"],
+      "a": 1,
+      "exp": "服务端 LISTEN 收到 SYN，回复 SYN+ACK 并进入 SYN_RCVD，收到客户端的 ACK 后转 ESTABLISHED 并放入 accept 队列。这时的半连接放在 syn 队列（syn_table），全连接放在 accept 队列。backlog 溢出时，前者受 tcp_max_syn_backlog 与 syncookies 影响，后者受 listen(fd, backlog) 影响。",
+      "level": "高频",
+      "tags": ["TCP", "状态机"]
+    },
+    {
+      "id": "n-002",
+      "q": "主动关闭连接的一方为什么需要 TIME_WAIT 状态，并等待 2MSL？",
+      "opts": [
+        "为了让对端有时间发数据",
+        "为了保证最后那个 ACK 能重传（对端重发的 FIN 能被正确回应），并让本连接的旧报文在网络中彻底消失，避免污染使用相同四元组的新连接",
+        "为了释放文件描述符",
+        "内核实现限制，无实际意义"
+      ],
+      "a": 1,
+      "exp": "两个目的：一是最后的 ACK 若丢失，对端会重发 FIN，处于 TIME_WAIT 的一方还能重发 ACK；二是 2MSL 足以让本连接的所有报文消亡，防止新连接收到旧连接的迷途报文。代价是大量短连接会堆积 TIME_WAIT 占用端口，可用 SO_REUSEADDR 缓解（它不能消除 TIME_WAIT，只是允许绑定）。",
+      "level": "高频",
+      "tags": ["TCP", "TIME_WAIT"]
+    },
+    {
+      "id": "n-003",
+      "q": "epoll 相对 select/poll 的核心优势是？",
+      "opts": [
+        "支持更多协议",
+        "内核用红黑树维护关注集、就绪链表返回结果，事件复杂度为 O(就绪数) 而非 O(关注总数)，且无需每次调用重复传入全部 fd 集合",
+        "epoll 不需要系统调用",
+        "epoll 支持阻塞 IO，select 不支持"
+      ],
+      "a": 1,
+      "exp": "select 有 FD_SETSIZE=1024 限制且每次调用都要把集合拷进内核、返回后再线性扫描；poll 去掉了 1024 限制但仍需全量拷贝与扫描。epoll 把注册（EPOLL_CTL_ADD）与等待（epoll_wait）分开，回调在事件到来时把 fd 挂到就绪链表，返回的开销与就绪数成正比。注意：epoll 在 fd 极多但几乎全活跃时并不比 poll 快，它的优势在「大量 fd、少量活跃」。",
+      "level": "高频",
+      "tags": ["epoll", "IO 多路复用"]
+    },
+    {
+      "id": "n-004",
+      "q": "水平触发（LT）与边缘触发（ET）的关键区别是？",
+      "opts": [
+        "ET 更快，LT 已废弃",
+        "LT：只要缓冲区还有数据，每次 epoll_wait 都会返回该 fd；ET：仅在状态变化时通知一次，必须一次读到 EAGAIN，否则剩余数据不再触发",
+        "ET 只能用于 UDP",
+        "两者只影响写事件"
+      ],
+      "a": 1,
+      "exp": "ET 要求 fd 是非阻塞的，并且在收到事件后循环 read/write 直到返回 EAGAIN，否则数据会滞留且不再有通知。ET 减少了 epoll_wait 的唤醒次数，但编程错误会直接导致「卡住」。LT 容错性好，代价是可能反复唤醒。Nginx 等高性能服务器普遍用 ET。",
+      "level": "高频",
+      "tags": ["epoll", "LT/ET"]
+    },
+    {
+      "id": "n-005",
+      "q": "sendfile() 相比 read()+write() 的零拷贝优势体现在？",
+      "opts": [
+        "不需要系统调用",
+        "省去了数据从内核页缓存拷贝到用户缓冲区的那一次拷贝与两次上下文切换，数据直接在内核内部从 page cache 送到 socket 缓冲区",
+        "可以压缩数据",
+        "绕过 TCP 协议栈"
+      ],
+      "a": 1,
+      "exp": "read()+write() 要经历：内核→用户、用户→内核 socket buffer，共两次拷贝、四次上下文切换。sendfile 让数据留在内核里，只传描述符。配合网卡的 scatter-gather（DMA gather）甚至可省掉到 socket buffer 的拷贝，即真正的「零拷贝」。splice 则通过管道在不同 fd 间搬数据，适用于非 socket 目标。",
+      "level": "高频",
+      "tags": ["零拷贝", "sendfile"]
+    },
+    {
+      "id": "n-006",
+      "q": "Linux 收包路径中，NAPI 的作用是？",
+      "opts": [
+        "提高网卡带宽上限",
+        "在中高负载下关闭每包中断，改为轮询（poll）批量收包，避免中断风暴（live-lock）",
+        "实现多队列",
+        "做报文校验"
+      ],
+      "a": 1,
+      "exp": "网卡收到包触发硬中断，上半部只做最少的工作（关中断、调度 NAPI），然后让 softirq 里的 poll 方法批量从 ring 里取包，取够预算（net.core.netdev_budget）或取空才重新开中断。这样在高包量时从「每包一中断」变成「一次中断收一批」。RSS/RPS 则是在多核之间分发的互补机制。",
+      "level": "中频",
+      "tags": ["收包路径", "NAPI"]
+    },
+    {
+      "id": "n-007",
+      "q": "TCP 拥塞控制中，CUBIC 与 BBR 的根本差异是？",
+      "opts": [
+        "CUBIC 基于丢包信号调整窗口，BBR 基于建模出的带宽与最小 RTT 主动控制发送速率，不把丢包等同于拥塞",
+        "BBR 只用于无线网络",
+        "CUBIC 是拥塞控制，BBR 是流量整形",
+        "两者都是基于丢包的"
+      ],
+      "a": 1,
+      "exp": "CUBIC（Linux 默认）属于 loss-based：窗口按三次函数增长，丢包即视为拥塞而大幅收缩。在有随机丢包或深缓冲（bufferbloat）的链路上会误判。BBR 维护瓶颈带宽与最小 RTT 的估计，按 BDP 控制 pacing 速率，因此在长肥管道和高丢包链路上表现更好，但公平性与深队列共存时仍有争议。",
+      "level": "中频",
+      "tags": ["TCP", "拥塞控制"]
+    },
+    {
+      "id": "n-008",
+      "q": "Nagle 算法与延迟 ACK 同时开启时可能造成什么问题？",
+      "opts": [
+        "带宽利用率下降",
+        "小包被积压等待 ACK，而 ACK 又在等待数据或超时，形成互相等待，导致最高约 40ms 的额外延迟",
+        "连接无法建立",
+        "触发重传风暴"
+      ],
+      "a": 1,
+      "exp": "Nagle 规定「有未确认数据时不发小包」，延迟 ACK 规定「收到数据后等一小会儿，看能否捎带 ACK」。两者叠加会出现：发送方等 ACK 才发下一个包，接收方等更多数据才发 ACK。延迟敏感的应用（如游戏、RPC）应设 TCP_NODELAY 关闭 Nagle。",
+      "level": "中频",
+      "tags": ["TCP", "Nagle"]
+    },
+    {
+      "id": "n-009",
+      "q": "RDMA 的核心特征不包括？",
+      "opts": [
+        "内核旁路（kernel bypass），用户态直接提交工作请求",
+        "零拷贝，数据直接在注册内存与网卡之间 DMA",
+        "基于可靠的、面向连接的字节流语义",
+        "通过 Queue Pair 与 Completion Queue 异步完成"
+      ],
+      "a": 2,
+      "exp": "RDMA 提供的是消息（message）语义而非 TCP 那样的字节流：Send/Recv 与 Read/Write 操作作用在注册的内存区（MR）上，完成后在 CQ 里产生 CQE。它支持 RC/UC/UD 等传输类型，其中 UD 是不可靠无连接的。核心价值是内核旁路 + 零拷贝，代价是必须预先 pin 内存、不可随意换出。",
+      "level": "中频",
+      "tags": ["RDMA", "高性能网络"]
+    },
+    {
+      "id": "n-010",
+      "q": "关于 MTU 与 MSS，正确的说法是？",
+      "opts": [
+        "MTU 是 TCP 层的概念，MSS 是链路层的概念",
+        "MTU 是链路层单帧可承载的最大载荷（以太网默认 1500），MSS = MTU − IP 头 − TCP 头，用于 TCP 分段协商",
+        "两者数值相同",
+        "MSS 由应用层设置"
+      ],
+      "a": 1,
+      "exp": "以太网 MTU 1500，IPv4 头 20 + TCP 头 20，得 MSS 1460。MSS 在三次握手时通过 SYN 选项协商，取双方较小值。路径 MTU 更小时（如隧道封装）若不分片会丢包并依赖 PMTUD，黑洞场景下常见「能 ping 通但大包卡死」。",
+      "level": "中频",
+      "tags": ["TCP", "MTU"]
+    },
+    {
+      "id": "n-011",
+      "q": "大量连接处于 CLOSE_WAIT 状态，通常说明？",
+      "opts": [
+        "网络链路故障",
+        "对端已发 FIN，本端应用没有调用 close()，是程序 bug（未关闭 fd 或阻塞在读上）",
+        "内核参数配置错误",
+        "存在 SYN flood 攻击"
+      ],
+      "a": 1,
+      "exp": "CLOSE_WAIT 表示被动关闭方已收到 FIN。此时内核已把 EOF 交给应用，剩下的必须由应用 close()。堆积说明应用没有正确处理连接关闭——常见于异常分支漏了 close、或用完 fd 却没归还连接池。TIME_WAIT 多通常是主动关闭量大（正常现象），CLOSE_WAIT 多则几乎一定是自己的代码问题。",
+      "level": "高频",
+      "tags": ["TCP", "排障"]
+    },
+    {
+      "id": "n-012",
+      "q": "select 的 FD_SETSIZE 默认值是多少？",
+      "opts": ["256", "1024", "4096", "65535"],
+      "a": 1,
+      "exp": "glibc 的 FD_SETSIZE 默认 1024，fd_set 是定长位图。要突破需在编译整个相关库之前重定义它并重新编译，实践中几乎没人这么做，所以高并发一律用 epoll（Linux）/ kqueue（BSD）。注意这只是用户态限制，不是内核限制。",
+      "level": "低频",
+      "tags": ["select", "IO 多路复用"]
+    }
+  ]
+}

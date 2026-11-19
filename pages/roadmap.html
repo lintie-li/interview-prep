@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>岗位要求与知识路线 · 面试准备</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="roadmap">
+<div id="topbar" data-base="../"></div>
+<div style="position:sticky;top:56px;z-index:49;height:3px;background:transparent"><i id="read-bar" style="display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--purple))"></i></div>
+
+<div class="wrap">
+<div class="layout">
+  <aside class="sidebar"><div id="toc"></div></aside>
+
+  <main class="content">
+    <h1>岗位要求与知识路线</h1>
+    <p style="color:var(--text-dim);font-size:15.5px">
+      先看清"他们要什么"，再决定"我补什么"。本页整理了 GPU / 系统软件方向的真实招聘要求，
+      并映射到本站各个专题。
+    </p>
+
+    <div class="box">
+      <span class="box-title">一句话结论</span>
+      这个方向的面试不是考"你知不知道 XX 概念"，而是考<strong>你是否真正在系统层工作过</strong>：
+      你写过驱动吗？你调过内存一致性问题吗？你在多核并发下定位过偶发 hang 吗？
+      所有知识都要能落到<strong>"我遇到过 / 我怎么解决的"</strong>这个答案上。
+    </div>
+
+    <h2 id="jd-nvidia">NVIDIA 真实 JD 拆解</h2>
+    <p>以下三条是我抓取的 NVIDIA Workday 招聘系统原文（2026 年），分别代表三个典型方向。</p>
+
+    <h3 id="jd-cuda-driver">① Senior Software Engineer – CUDA Driver</h3>
+    <p><small>来源：NVIDIA 官方招聘系统，Santa Clara，5+ 年经验</small></p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:120px">类别</th><th>原文要求</th></tr></thead>
+        <tbody>
+          <tr><td><strong>硬门槛</strong></td><td>Strong C programming skills; 5+ years developing systems software; BS/MS in CS/EE</td></tr>
+          <tr><td><strong>必修</strong></td><td>Experience designing, debugging, and maintaining <strong>complex software stacks</strong></td></tr>
+          <tr><td><strong>必修</strong></td><td>OS interfaces for <strong>threads, process control, and virtual memory</strong></td></tr>
+          <tr><td><strong>必修</strong></td><td>HW/SW co-design, performance modeling using emulation/simulation</td></tr>
+          <tr><td><strong>必修</strong></td><td>System-level architecture: <strong>interconnects, memory hierarchy, interrupts, MMIO</strong></td></tr>
+          <tr><td><strong>加分</strong></td><td>Kernel scheduling, task runtimes, <strong>kernel-mode development</strong>, Linux systems software</td></tr>
+          <tr><td><strong>加分</strong></td><td>Parallel computing / CUDA programming</td></tr>
+          <tr><td><strong>加分</strong></td><td><strong>Memory coherence and consistency models</strong></td></tr>
+          <tr><td><strong>加分</strong></td><td>Distributed training/inference patterns (data/model/pipeline parallelism)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 id="jd-umd">② Principal Engineer – CUDA UMD, GPU Kernel Scheduling</h3>
+    <p><small>来源：NVIDIA 官方招聘系统，Santa Clara，15+ 年经验（高级标杆）</small></p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:120px">类别</th><th>原文要求</th></tr></thead>
+        <tbody>
+          <tr><td><strong>核心</strong></td><td>"deep understanding of <strong>device drivers</strong>" + "phenomenal C/C++ skills"</td></tr>
+          <tr><td><strong>工作</strong></td><td>Architect and implement new features in the <strong>CUDA Driver</strong></td></tr>
+          <tr><td><strong>工作</strong></td><td>Extend programming models such as <strong>CUDA Graphs</strong>，改进 AI/ML 负载调度</td></tr>
+          <tr><td><strong>必修</strong></td><td>OS interfaces for threads / process control / virtual memory</td></tr>
+          <tr><td><strong>必修</strong></td><td>Debugging <strong>multithreaded programs</strong></td></tr>
+          <tr><td><strong>必修</strong></td><td>Large codebase experience; cross-team project driving</td></tr>
+          <tr><td><strong>加分</strong></td><td>Interconnects, memory hierarchy, interrupts, MMIO</td></tr>
+          <tr><td><strong>加分</strong></td><td>Memory coherence / consistency models</td></tr>
+          <tr><td><strong>加分</strong></td><td>Kernel mode development; Linux systems software</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="box ok">
+      <span class="box-title">这条 JD 的价值</span>
+      它是"资深"的最好画像：<strong>UMD 用户态驱动 + 内核调度</strong>，正好对应本材料的主线。
+      注意 "device drivers" 被列为第一句话，且和 <strong>15 年经验</strong>绑在一起 —— 说明这个方向走的是
+      "把驱动做深"，而不是"多会几种框架"。
+    </div>
+
+    <h3 id="jd-virt">③ Senior Software Engineer – Virtualization and Linux Kernel</h3>
+    <p><small>来源：NVIDIA 官方招聘系统，12+ 年经验</small></p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:120px">类别</th><th>原文要求</th></tr></thead>
+        <tbody>
+          <tr><td><strong>工作</strong></td><td>为 NVIDIA GPU 虚拟化（vGPU、Nova）维护<strong>上游 Linux 内核</strong>支持</td></tr>
+          <tr><td><strong>工作</strong></td><td>横跨 <strong>KVM、QEMU、VFIO</strong>：device assignment、<strong>PCIe SR-IOV</strong>、内存管理、虚拟设备生命周期</td></tr>
+          <tr><td><strong>必修</strong></td><td>12+ 年 Linux 内核或虚拟化经验；有<strong>上游社区 patch 被合入</strong>的记录</td></tr>
+          <tr><td><strong>必修</strong></td><td>In-depth Linux kernel internals: <strong>device-driver model, memory management, synchronization and concurrency</strong></td></tr>
+          <tr><td><strong>必修</strong></td><td>虚拟化：host/guest 交互、<strong>内存翻译</strong>、设备直通、中断、资源隔离</td></tr>
+          <tr><td><strong>必修</strong></td><td>GDB / KGDB / <strong>ftrace</strong> / perf 定位复杂内核问题</td></tr>
+          <tr><td><strong>语言</strong></td><td>C + <strong>Rust</strong>（ownership、lifetimes、与 C 互操作）</td></tr>
+          <tr><td><strong>加分</strong></td><td>GPU 架构 / 驱动 / GPU 虚拟化；<strong>DRM、Nouveau、Nova</strong></td></tr>
+          <tr><td><strong>加分</strong></td><td>IOMMU、设备模拟、虚拟设备迁移、低层固件接口</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="patterns">中文语境下的同类岗位</h2>
+    <p>
+      AMD（ROCm / amdgpu）、Qualcomm（Adreno / KGSL）、以及国内的 GPU 厂商，岗位描述结构高度相似，
+      只是专有名词不同。把它们对齐来看：
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>能力项</th><th>NVIDIA</th><th>AMD</th><th>Qualcomm</th><th>本站专题</th></tr></thead>
+        <tbody>
+          <tr><td>用户态驱动</td><td>CUDA UMD</td><td>ROCm / HIP runtime、Vulkan UMD</td><td>Adreno UMD</td><td><a href="gpu.html">GPU/CUDA</a></td></tr>
+          <tr><td>内核态驱动</td><td>nvidia.ko</td><td>amdgpu / amdkfd</td><td>KGSL / msm DRM</td><td><a href="kernel.html">内核与驱动</a></td></tr>
+          <tr><td>命令提交/调度</td><td>GPU Kernel Scheduling</td><td>MEC / MES firmware scheduler</td><td>ringbuffer dispatch</td><td><a href="gpu.html">GPU/CUDA</a></td></tr>
+          <tr><td>显存管理</td><td>Unified Memory、HMM</td><td>TTM / GEM / KFD</td><td>ION / dma-buf</td><td><a href="kernel.html">内核</a></td></tr>
+          <tr><td>虚拟化</td><td>vGPU、SR-IOV</td><td>MxGPU / SR-IOV</td><td>Hypervisor 上的 GPU</td><td><a href="virt.html">虚拟化</a></td></tr>
+          <tr><td>图形栈</td><td>DRM / Nouveau / Nova</td><td>DRM amdgpu</td><td>DRM msm / freedreno</td><td><a href="kernel.html">内核</a></td></tr>
+          <tr><td>计算 API</td><td>CUDA</td><td>HIP / OpenCL</td><td>OpenCL / Vulkan compute</td><td><a href="gpu.html">GPU/CUDA</a></td></tr>
+          <tr><td>性能工具</td><td>Nsight</td><td>rocprof</td><td>Snapdragon Profiler</td><td><a href="sysdebug.html">调试与性能</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="map">把 JD 映射到知识点</h2>
+    <p>根据上面 JD 里的高频词，统计出应该投入精力的权重：</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>知识点</th><th>JD 命中</th><th>你该投入</th><th>专题</th></tr></thead>
+        <tbody>
+          <tr><td>C / C++ 系统编程</td><td>几乎每条 JD</td><td><span class="tag red">最高</span></td><td><a href="cpp.html">C/C++</a></td></tr>
+          <tr><td>Linux 内核：MM / 并发 / 驱动模型</td><td>每条 JD</td><td><span class="tag red">最高</span></td><td><a href="kernel.html">内核</a></td></tr>
+          <tr><td>GPU 架构与驱动分层</td><td>每条 JD</td><td><span class="tag red">最高</span></td><td><a href="gpu.html">GPU</a></td></tr>
+          <tr><td>多线程与并发调试</td><td>每条 JD</td><td><span class="tag amber">高</span></td><td><a href="cpp.html">C/C++</a></td></tr>
+          <tr><td>内存一致性模型</td><td>两条 JD 明确列出</td><td><span class="tag amber">高</span></td><td><a href="gpu.html">GPU</a>、<a href="cpp.html">C++</a></td></tr>
+          <tr><td>perf / ftrace / GDB</td><td>虚拟化 JD 明确列出</td><td><span class="tag amber">高</span></td><td><a href="sysdebug.html">调试</a></td></tr>
+          <tr><td>PCIe / IOMMU / SR-IOV</td><td>虚拟化方向</td><td><span class="tag blue">中</span></td><td><a href="virt.html">虚拟化</a></td></tr>
+          <tr><td>网络协议栈 / RDMA</td><td>分布式训练加分项</td><td><span class="tag blue">中</span></td><td><a href="net.html">网络</a></td></tr>
+          <tr><td>Python</td><td>不直接要求，但工具链常用</td><td><span class="tag blue">低</span></td><td><a href="python.html">Python</a></td></tr>
+          <tr><td>Rust（kernel）</td><td>NVIDIA 虚拟化 JD 要求</td><td><span class="tag purple">按需</span></td><td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="gaps">从后端到驱动：常见的能力落差</h2>
+    <p>后端 → 驱动是"越往下走"，需要补的不只是知识，还有<strong>思维方式</strong>：</p>
+
+    <div class="box warn">
+      <span class="box-title">落差 1：从"逻辑正确"到"时序正确"</span>
+      后端代码错了重跑一次基本就过去了。驱动错了会<strong>偶发 hang、数据损坏、整机 panic</strong>，
+      而且可能几千次才复现一次。所以面试官会追问：你怎么证明你的并发代码是对的？
+      你遇到过 race condition 吗？怎么定位的？
+    </div>
+    <div class="box warn">
+      <span class="box-title">落差 2：从"资源无限"到"资源是硬约束"</span>
+      后端可以加机器、加内存。驱动里 <code>kmalloc(GFP_ATOMIC)</code> 失败就是失败，
+      中断上下文不能睡，栈只有 16KB（x86-64 内核栈典型 16KB）。
+      这些约束必须是<strong>条件反射</strong>，而不是"查一下再说"。
+    </div>
+    <div class="box warn">
+      <span class="box-title">落差 3：从"看到现象"到"看到硬件"</span>
+      后端 debug 看日志。驱动 debug 要看寄存器、看 DMA 地址、看 PCIe 配置空间、
+      用逻辑分析仪或 ftrace 看事件顺序。你需要建立<strong>从软件到硬件的心智模型</strong>。
+    </div>
+    <div class="box ok">
+      <span class="box-title">你的优势</span>
+      后端背景带来的<strong>大型系统设计能力、可观测性思维、工程化习惯</strong>恰恰是很多纯内核背景的人欠缺的。
+      NVIDIA 的 JD 反复强调 "large codebases"、"cross-team"、"maintainable and well-tested code" ——
+      这些是你的加分项，不要丢。
+    </div>
+
+    <h2 id="plan">8 周准备路线</h2>
+    <p>假设每天 2 小时、周末 4 小时。<strong>顺序很重要</strong>：先补基础，再攻专项。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:70px">周次</th><th>主题</th><th>目标</th></tr></thead>
+        <tbody>
+          <tr><td><strong>W1</strong></td><td>C 语言深水区</td><td>指针/数组退化、UB、内存布局、<code>volatile</code>、位运算、结构体对齐</td></tr>
+          <tr><td><strong>W2</strong></td><td>C++ 对象模型</td><td>虚函数表、RAII、移动语义、模板、多线程内存序</td></tr>
+          <tr><td><strong>W3</strong></td><td>操作系统与内核基础</td><td>进程/线程、调度、虚拟内存、页表、系统调用路径</td></tr>
+          <tr><td><strong>W4</strong></td><td>内核并发与中断</td><td>自旋锁/互斥/RCU、原子操作、软中断、workqueue、top/bottom half</td></tr>
+          <tr><td><strong>W5</strong></td><td>驱动开发</td><td>字符设备、<code>file_operations</code>、ioctl、mmap、DMA、中断处理</td></tr>
+          <tr><td><strong>W6</strong></td><td>GPU 软件栈</td><td>UMD/KMD 分层、CUDA 上下文/流、显存管理、命令提交、同步原语</td></tr>
+          <tr><td><strong>W7</strong></td><td>虚拟化 + 调试性能</td><td>KVM/VFIO/SR-IOV/IOMMU；perf、ftrace、eBPF、GDB</td></tr>
+          <tr><td><strong>W8</strong></td><td>网络 + 复盘</td><td>TCP/IP、epoll、RDMA；刷错题，把 Q&A 讲一遍</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box danger">
+      <span class="box-title">面试中最容易翻车的地方</span>
+      <ul style="margin-bottom:0">
+        <li><strong>只会背不会写</strong>：让你手写一个自旋锁 / 环形缓冲区 / 无锁队列，写不出来。</li>
+        <li><strong>说不出数字</strong>：页大小多少？内核栈多大？中断上下文为什么不能睡？答不上具体值。</li>
+        <li><strong>没有主线</strong>：讲项目像流水账，说不出"我做的技术决策是什么、为什么这样选"。</li>
+        <li><strong>不懂硬件</strong>：面 GPU 岗却讲不清 GPU 为什么快、显存和 CPU 内存的本质区别。</li>
+      </ul>
+    </div>
+
+    <h2 id="next">下一步</h2>
+    <div class="grid grid-2">
+      <a class="card" href="../quiz/index.html">
+        <h3>先做一遍摸底题 →</h3>
+        <p>每个专题都有选择题，先刷一遍看看自己在哪一层，再回来有重点地读。</p>
+      </a>
+      <a class="card" href="kernel.html">
+        <h3>从 Linux 内核开始读 →</h3>
+        <p>内核是这一整条线的地基，也是 JD 里出现频率最高的词。</p>
+      </a>
+    </div>
+  </main>
+</div>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

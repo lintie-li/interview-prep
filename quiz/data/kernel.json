@@ -1,0 +1,218 @@
+{
+  "questions": [
+    {
+      "id": "k-001",
+      "q": "x86-64 在默认的四级页表配置下，线性地址是多少位？",
+      "opts": ["32 位", "40 位", "48 位", "64 位"],
+      "a": 2,
+      "exp": "四级页表按 9+9+9+9+12 拆位，合计 48 位。剩下高 16 位必须做符号扩展（第 47 位决定）。开启 5-level paging（LA57）后扩展到 57 位。",
+      "level": "高频",
+      "tags": ["内存管理", "页表"]
+    },
+    {
+      "id": "k-002",
+      "q": "x86-64 上内核栈的默认大小是多少？",
+      "opts": ["4 KB", "8 KB", "16 KB", "32 KB"],
+      "a": 2,
+      "exp": "THREAD_SIZE_ORDER 默认为 2，即 4 个 4KB 页 = 16KB。中断/异常上下文共用当前任务的内核栈（不进线程），所以栈里写的临时数据要考虑并发与深度。",
+      "level": "高频",
+      "tags": ["进程", "栈"]
+    },
+    {
+      "id": "k-003",
+      "q": "在 Linux 内核里，进程和线程在数据结构上是什么关系？",
+      "opts": [
+        "线程是 task_struct 的子结构，进程是父结构",
+        "二者都用 task_struct 描述，区别只在 clone() 时是否共享地址空间等资源",
+        "进程用 task_struct，线程用单独的 thread_struct",
+        "内核不区分，靠用户态 pthread 库自己实现"
+      ],
+      "a": 1,
+      "exp": "Linux 内核不设独立的 thread 结构，统一是 task_struct。传 CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD 就得到「线程」，不传就是独立进程。这也解释了为什么创建线程和创建进程在内核里开销相近。",
+      "level": "高频",
+      "tags": ["进程", "调度"]
+    },
+    {
+      "id": "k-004",
+      "q": "CFS 调度器选择下一个可运行任务时，依据的是哪个数据结构上的什么值？",
+      "opts": [
+        "链表，按静态优先级排序",
+        "红黑树，取 vruntime 最小的节点",
+        "哈希表，按 CPU 亲和性索引",
+        "最小堆，按 nice 值排序"
+      ],
+      "a": 1,
+      "exp": "CFS 用红黑树按 vruntime 排序，最左节点即 vruntime 最小者。vruntime 累加的是「实际运行时间 × 权重因子」，nice 值越高权重越低、vruntime 增长越快，于是被排到后面。",
+      "level": "高频",
+      "tags": ["调度", "CFS"]
+    },
+    {
+      "id": "k-005",
+      "q": "为什么中断上下文里不能睡眠（调用可能睡眠的函数）？",
+      "opts": [
+        "中断上下文没有 task_struct，无法调度",
+        "中断上下文不隶属任何进程，睡眠后没有可恢复的上下文，且会阻塞该 CPU 上的其他中断/软中断",
+        "内核配置默认禁止，可以手工打开",
+        "睡眠会让中断控制器丢中断"
+      ],
+      "a": 1,
+      "exp": "硬中断在「借用」被打断任务的内核栈上运行，且此时 preempt_count > 0、本 CPU 中断可能已关。schedule() 在原子上下文里会触发 `BUG: scheduling while atomic`。正确做法是把可能阻塞的工作推到 workqueue。",
+      "level": "高频",
+      "tags": ["中断", "并发"]
+    },
+    {
+      "id": "k-006",
+      "q": "关于 spinlock 与 mutex，下列说法正确的是？",
+      "opts": [
+        "spinlock 可以睡眠，mutex 不能睡眠",
+        "spinlock 忙等、持锁期间不能睡眠，可用于中断上下文；mutex 会睡眠、只能用于进程上下文",
+        "两者都可用于中断上下文",
+        "mutex 就是带超时的 spinlock"
+      ],
+      "a": 1,
+      "exp": "spinlock 持有期间会关闭抢占（在非 RT 内核上），因此不能睡眠，可用于硬中断。mutex 拿到锁失败会挂到等待队列并让出 CPU，所以只能用于允许睡眠的进程上下文。中断里要保护共享数据，用 spinlock 或 spin_lock_irqsave。",
+      "level": "高频",
+      "tags": ["并发", "锁"]
+    },
+    {
+      "id": "k-007",
+      "q": "RCU 的读侧临界区（rcu_read_lock/rcu_read_unlock）在非抢占 RCU 下的开销大致是？",
+      "opts": [
+        "一次原子加减，与写侧竞争同一缓存行",
+        "几乎没有开销：不修改共享计数，只是编译器屏障加禁止抢占",
+        "一次系统调用",
+        "一次内存分配"
+      ],
+      "a": 1,
+      "exp": "RCU 读侧不加锁、不改共享计数器，只做 barrier()，在可抢占内核里额外 preempt_disable()。因此读多写少的场景扩展性极好。写侧则要等所有 pre-existing 读者退出（宽限期 grace period）后才能释放旧对象。",
+      "level": "中频",
+      "tags": ["并发", "RCU"]
+    },
+    {
+      "id": "k-008",
+      "q": "kmalloc 与 vmalloc 的核心区别是？",
+      "opts": [
+        "kmalloc 分配物理连续内存，vmalloc 只保证虚拟地址连续",
+        "kmalloc 只能用于用户态，vmalloc 只能用于内核态",
+        "vmalloc 更快但碎片更多",
+        "两者完全等价，只是历史遗留"
+      ],
+      "a": 0,
+      "exp": "kmalloc 从 slab 分配物理连续内存，可直接给 DMA 用（配合同一设备约束），大小受 KMALLOC_MAX_CACHE_SIZE 限制。vmalloc 拼虚拟页、物理不连续，适合大块但会带来 TLB 和映射开销，且不能直接 DMA。",
+      "level": "高频",
+      "tags": ["内存管理"]
+    },
+    {
+      "id": "k-009",
+      "q": "GFP_ATOMIC 与 GFP_KERNEL 的区别，最主要体现在？",
+      "opts": [
+        "GFP_ATOMIC 分配更快",
+        "GFP_KERNEL 可能睡眠并回收内存，因此只能在允许睡眠的上下文使用；GFP_ATOMIC 不睡眠、更易失败，可用于中断上下文",
+        "GFP_ATOMIC 只能分配小于 4KB",
+        "GFP_KERNEL 会清零内存"
+      ],
+      "a": 1,
+      "exp": "GFP_KERNEL 走直接回收、可能等待 IO，所以在原子上下文里会 BUG。GFP_ATOMIC 只从空闲池拿，拿不到就返回 NULL，因此必须检查返回值。中断、持 spinlock 时用 GFP_ATOMIC。",
+      "level": "高频",
+      "tags": ["内存管理", "中断"]
+    },
+    {
+      "id": "k-010",
+      "q": "内核访问用户态指针为什么不能直接用 memcpy？",
+      "opts": [
+        "memcpy 在内核里不存在",
+        "用户指针不可信，可能未映射，直接解引用会触发 oops；copy_from_user 做了 access_ok 校验并用异常表兜住缺页",
+        "因为用户内存可能是高端内存",
+        "因为需要加锁"
+      ],
+      "a": 1,
+      "exp": "用户可能传一个野指针（甚至指向内核地址）。copy_from_user / copy_to_user 先做 access_ok 检查范围，拷贝时用 extable 注册异常表，一旦缺页就把失败转成返回值而不是 panic。这是内核必要的健壮性边界。",
+      "level": "高频",
+      "tags": ["驱动", "安全"]
+    },
+    {
+      "id": "k-011",
+      "q": "用户进程第一次写入一块刚 mmap 的匿名内存，会发生什么缺页？",
+      "opts": [
+        "major fault，需要读磁盘",
+        "minor fault，内核分配一个零页并填入页表",
+        "不会缺页，mmap 时已分配物理页",
+        "收到 SIGSEGV"
+      ],
+      "a": 1,
+      "exp": "匿名页 mmap 只建立 VMA，不分配物理页。首次写触发写保护的零页，内核分配一个 Page Anon 并建立映射（minor fault，无磁盘 IO）。若是文件映射则可能是 major fault，需要先把 page cache 读进来。",
+      "level": "高频",
+      "tags": ["内存管理", "缺页"]
+    },
+    {
+      "id": "k-012",
+      "q": "内核把中断处理拆成 top half 与 bottom half，主要目的是？",
+      "opts": [
+        "为了支持多核",
+        "硬中断里关中断执行，必须尽快返回；把耗时部分推迟到 softirq/tasklet/workqueue，减少中断关闭时间和丢中断风险",
+        "为了让用户态能处理中断",
+        "为了节省内存"
+      ],
+      "a": 1,
+      "exp": "top half 运行在关中断或至少关本 CPU 中断的状态下，拖久了会丢中断、增加延迟。softirq/tasklet 在中断返回后以可被中断的方式运行；workqueue 跑在内核线程里，可以睡眠。选型看是否需要睡眠。",
+      "level": "高频",
+      "tags": ["中断", "top-bottom"]
+    },
+    {
+      "id": "k-013",
+      "q": "关于 DMA 的 coherent 映射与 streaming 映射，说法正确的是？",
+      "opts": [
+        "coherent 映射针对一块缓冲区长期使用，CPU 与设备看到一致视图，通常不可 cache 或做了 cache 维护；streaming 映射用于单次传输，需要 dma_sync_* 显式同步",
+        "两者都需要手动调用 dma_sync_single_for_cpu",
+        "streaming 映射的内存由内核自动回收",
+        "coherent 映射比 streaming 更快"
+      ],
+      "a": 0,
+      "exp": "dma_alloc_coherent 返回长期可用的、CPU/设备一致的缓冲区（代价通常是 uncached/写合并，访问慢）。dma_map_single 是 streaming 映射，映射/解映射之间所有权转移，CPU 与设备交替访问时要用 dma_sync_single_for_cpu/device 保持 cache 一致。",
+      "level": "中频",
+      "tags": ["驱动", "DMA"]
+    },
+    {
+      "id": "k-014",
+      "q": "spin_lock 与 spin_lock_irqsave 的选择依据是？",
+      "opts": [
+        "性能优先用 spin_lock",
+        "如果同一把锁还会在硬中断里被获取，本地必须用 spin_lock_irqsave 关中断，否则可能在持锁时被中断、中断里再抢同一把锁而死锁",
+        "spin_lock_irqsave 是给多核用的，spin_lock 是给单核用的",
+        "两者可互换"
+      ],
+      "a": 1,
+      "exp": "死锁场景：进程上下文持锁 → 本 CPU 被中断 → 中断处理里再 spin_lock 同一把锁 → 永远自旋（中断不会返回）。所以锁若被中断路径获取，进程侧必须关本地中断。注意关的只是本 CPU 中断，跨 CPU 靠自旋。",
+      "level": "高频",
+      "tags": ["并发", "锁"]
+    },
+    {
+      "id": "k-015",
+      "q": "VFS 中 dentry 与 inode 的关系是？",
+      "opts": [
+        "一一对应，不可分离",
+        "dentry 表示路径中的一个名字节点，inode 表示文件本身；多个 dentry（硬链接、挂载）可指向同一个 inode",
+        "inode 只存在于磁盘，dentry 只存在于内存",
+        "两者都是磁盘结构"
+      ],
+      "a": 1,
+      "exp": "dentry 是目录项缓存（dcache），把「名字 → inode」缓存起来加速路径查找，是内存结构。inode 描述文件元数据，可来自磁盘也可纯内存（如 procfs）。硬链接就是多个 dentry 指向同一 inode。",
+      "level": "中频",
+      "tags": ["文件系统", "VFS"]
+    },
+    {
+      "id": "k-016",
+      "q": "PREEMPT_RT 补丁与主线内核的主要差异不包括？",
+      "opts": [
+        "把大部分 spinlock 替换为可睡眠的 rt_mutex",
+        "把硬中断线程化为内核线程",
+        "提高最坏情况下的调度延迟上限",
+        "让内核栈从 16KB 变成 32KB"
+      ],
+      "a": 3,
+      "exp": "PREEMPT_RT 的核心是降低最坏延迟：spinlock 改 rt_mutex（支持优先级继承）、中断线程化、高精度定时器、降低关抢占临界区。它与内核栈大小无关。代价是吞吐量下降。",
+      "level": "低频",
+      "tags": ["调度", "实时"]
+    }
+  ]
+}

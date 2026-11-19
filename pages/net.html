@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>计算机网络 · 面试准备</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="net">
+<div id="topbar" data-base="../"></div>
+<div style="position:sticky;top:56px;z-index:49;height:3px;background:transparent"><i id="read-bar" style="display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--purple))"></i></div>
+
+<div class="wrap">
+<div class="layout">
+  <aside class="sidebar"><div id="toc"></div></aside>
+
+  <main class="content">
+    <h1>计算机网络</h1>
+    <p style="color:var(--text-dim);font-size:15.5px">
+      socket 你会用，协议细节你也读过。这一页只写<strong>你在面试里讲不清的那部分</strong>：
+      一个包在内核里走了哪些队列、epoll 的 ET 为什么必须读到 <code>EAGAIN</code>、
+      TIME_WAIT 和 CLOSE_WAIT 分别该怎么处置、CUBIC 和 BBR 到底差在哪、RDMA 为什么能绕过内核。
+    </p>
+    <div class="box warn">
+      <span class="box-title">本页的写法</span>
+      每小节按「会问 → 答案 → 追问」组织。数字和参数名都按 Linux 5.x 的默认值写；
+      凡是会随内核版本变化的，会注明版本。<strong>记不准的数字不要编</strong>，面试时说「我记得是 X 量级，具体看内核版本」比说错强。
+    </div>
+
+    <h2 id="numbers">关键数字</h2>
+    <p><strong>会问：</strong>一个 TCP 连接最多传多少数据？MTU 和 MSS 什么关系？TIME_WAIT 多久？</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>项目</th><th>数值</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>MTU（以太网）</td><td>1500 B</td><td>IP 层载荷上限；jumbo frame 通常 9000</td></tr>
+          <tr><td>以太网帧头</td><td>14 B</td><td>目的 MAC 6 + 源 MAC 6 + EtherType 2；尾部 FCS 4 B 不计入 MTU</td></tr>
+          <tr><td>IP 头 / TCP 头</td><td>20 B / 20 B</td><td>不含 option；带 timestamp + SACK 的 TCP 头通常 32 B</td></tr>
+          <tr><td>MSS</td><td>1460 B</td><td>1500 − 20 − 20；IPv6 下是 1440</td></tr>
+          <tr><td>端口</td><td>16 位</td><td>0–1023 特权端口；临时端口范围 <code>ip_local_port_range</code></td></tr>
+          <tr><td>TCP 序号</td><td>32 位</td><td>4 GB 回绕；靠 timestamp 做 PAWS 防旧包</td></tr>
+          <tr><td>窗口字段</td><td>16 位 = 65535</td><td>超过必须开 window scaling，否则长肥管道吃不满</td></tr>
+          <tr><td>初始拥塞窗口</td><td>10 MSS</td><td>RFC 6928；Linux 按 <code>tcp_init_cwnd()</code> 取 10</td></tr>
+          <tr><td>TIME_WAIT</td><td>2 × MSL = 60 s</td><td>Linux 里 <code>TCP_TIMEWAIT_LEN</code> 写死 60 秒，<strong>不可调</strong></td></tr>
+          <tr><td>SYN 重传</td><td>默认 6 次</td><td><code>tcp_syn_retries</code>，指数退避，总计约 127 s</td></tr>
+          <tr><td>接收缓冲</td><td>4096 / 131072 / 6291456</td><td><code>tcp_rmem</code> 的 min/default/max（5.x）</td></tr>
+          <tr><td>发送缓冲</td><td>4096 / 16384 / 4194304</td><td><code>tcp_wmem</code></td></tr>
+          <tr><td>accept 队列</td><td>4096</td><td><code>somaxconn</code> 默认；5.4 之前是 128</td></tr>
+          <tr><td>NAPI 预算</td><td>300 包 / 2 ms</td><td><code>netdev_budget</code> / <code>netdev_budget_usecs</code>；单设备单次 poll 权重 64</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>追问：</strong>抓包看到 64 KB 的 TCP segment，可 MSS 不是 1460 吗？—— 那是发送端开了 TSO，内核把大块数据交给网卡切包；接收端对应的合并叫 GRO。offload 关闭时才会看到「一个 segment 一个包」。</p>
+
+    <h2 id="tcp">TCP 状态机与握手挥手</h2>
+
+    <h3 id="handshake">三次握手：只补最容易被问倒的点</h3>
+    <p><strong>会问：</strong>为什么不能两次？四次行不行？ISN 为什么随机？</p>
+    <p>
+      两次握手的问题不是「同步不了序号」——序号在 SYN 和 SYN-ACK 里已经各带了一个。
+      真正的问题是<strong>服务端无法确认客户端收到了 SYN-ACK</strong>：这个包丢了，服务端会单方面认为连接已建立并分配资源，
+      客户端却还在重传 SYN。多出的第三次 ACK 就是让服务端确认「对端已就绪」。
+      另一层作用是拒绝网络里滞留的旧 SYN：客户端用序号判断这不是本次连接，回 RST。
+    </p>
+    <pre><code>CLOSED ──主动打开/SYN──► SYN_SENT ──收 SYN+ACK/回 ACK──► ESTABLISHED
+CLOSED ──被动打开/收 SYN,回 SYN+ACK──► SYN_RCVD ──收 ACK──► ESTABLISHED
+                                                    ▲
+                        同时打开（少见）: SYN_SENT 收 SYN 不回 ACK 而回 SYN</code></pre>
+    <p>
+      ISN 随机不是为了安全（那是加密的事），而是<strong>避免与旧连接的序号空间重叠</strong>，
+      再加上 timestamp 的 PAWS 机制，才能可靠地区分新旧报文。
+    </p>
+    <p><strong>追问：</strong>SYN 丢了会怎样？—— 客户端指数退避重传（1s、2s、4s…），默认 6 次后放弃，约 127 秒。服务端侧如果 SYN-ACK 丢了，由 <code>tcp_synack_retries</code> 控制。</p>
+
+    <h3 id="syn-flood">SYN flood 与 SYN cookie</h3>
+    <p><strong>会问：</strong>SYN flood 打的是什么资源？SYN cookie 怎么做到不存状态？</p>
+    <p>
+      半连接（<code>SYN_RCVD</code>）是要占内核对象的：<code>request_sock</code>。攻击者伪造源 IP 发大量 SYN、
+      不回最后的 ACK，这些半连接把资源耗尽，正常握手进不来。
+    </p>
+    <p>
+      SYN cookie 的做法是<strong>不分配 request_sock</strong>：收到 SYN 时，用
+      「源 IP、源端口、目的 IP、目的端口 + 一个每秒轮换的密钥」做哈希，取其中 24 位，
+      加上 5 位时间槽和 3 位 MSS 索引，拼成 32 位塞进 SYN-ACK 的 <code>seq</code>。
+      客户端回来的 ACK 里 <code>seq = cookie + 1</code>，服务端重算哈希校验，通过才创建连接。
+    </p>
+    <ul>
+      <li><code>net.ipv4.tcp_syncookies</code>：1 = 队列溢出时才启用（默认），2 = 强制。</li>
+      <li>代价：cookie 模式下放不下 window scaling / SACK 等 option，功能退化，所以只在压力下用。</li>
+      <li>半连接数量上限受 <code>tcp_max_syn_backlog</code> 约束；全连接（已完成握手待 accept）受 <code>min(somaxconn, listen_backlog)</code> 约束。</li>
+    </ul>
+    <p><strong>追问：</strong>SYN cookie 能防什么、不能防什么？—— 防的是「伪造源 IP 的资源耗尽」，防不了真实 IP 的洪水（那要靠限速、清洗、anycast）。</p>
+
+    <h3 id="teardown">四次挥手与 TIME_WAIT 的两个作用</h3>
+    <p><strong>会问：</strong>为什么是四次？TIME_WAIT 为什么必须是 2MSL？</p>
+    <p>
+      全双工，两个方向要分别关闭：<code>FIN → ACK → FIN → ACK</code>。主动关闭方发完最后一个 ACK 后进入
+      <code>TIME_WAIT</code>，等 2MSL（Linux 固定 60 秒）。
+    </p>
+    <div class="box ok">
+      <span class="box-title">两个作用，必须完整说出来</span>
+      <strong>① 保证最后的 ACK 能到达对端。</strong>ACK 丢了，对端会重传 FIN；还在 TIME_WAIT 就能重新 ACK。
+      如果已经 CLOSED，收到重传的 FIN 只能回 RST，对端就不是正常关闭。
+      <br><strong>② 让旧连接的报文彻底消失。</strong>2MSL 覆盖「ACK 过去 + FIN 回来」的最坏往返，
+      保证相同四元组的新连接不会收到旧连接的残留报文。
+    </div>
+    <p>
+      为什么是 2 倍：最坏情况是 ACK 单向耗时 1 MSL、对端重传的 FIN 回来再耗 1 MSL。Linux 把 MSL 定为 30 秒，
+      于是 <code>TIME_WAIT</code> 恒为 60 秒，<strong><code>tcp_fin_timeout</code> 改的是 FIN_WAIT_2，不是 TIME_WAIT</strong>。
+    </p>
+    <p><strong>追问：</strong>为什么 TIME_WAIT 在主动关闭方？—— 因为它是最后一个发 ACK 的人，只有它需要「万一 ACK 丢了还能重发」。被动关闭方不需要。</p>
+
+    <h3 id="time-wait-ops">TIME_WAIT 过多 vs CLOSE_WAIT 堆积</h3>
+    <p><strong>会问：</strong>线上 TIME_WAIT 几万个，怎么处理？CLOSE_WAIT 很多说明什么？</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>状态</th><th>谁造成的</th><th>本质</th><th>处置</th></tr></thead>
+        <tbody>
+          <tr><td><code>TIME_WAIT</code></td><td>本机主动关闭</td><td>短连接太多、连接周转太快</td><td>连接池 / keep-alive；客户端侧 <code>tcp_tw_reuse=1</code>；服务端 <code>SO_REUSEADDR</code></td></tr>
+          <tr><td><code>CLOSE_WAIT</code></td><td>本机被动关闭</td><td><strong>应用没调 <code>close()</code></strong>，连接泄漏</td><td>改代码。检查 <code>recv()==0</code> 后是否关闭、异常分支是否漏 fd、fd 是否被别处持有</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <pre><code>ss -s                              <span class="c"># 各状态计数</span>
+ss -tan state time-wait | wc -l
+ss -tan state close-wait | head
+lsof -p &lt;pid&gt; | wc -l              <span class="c"># 对照 /proc/&lt;pid&gt;/limits 的 open files</span></code></pre>
+    <ul>
+      <li><code>tcp_tw_reuse=1</code>：<strong>只对主动发起的新连接</strong>有效，且依赖 <code>tcp_timestamps=1</code>（默认开）。NAT 环境慎用。</li>
+      <li><code>tcp_tw_recycle</code>：4.12 已从内核移除，别答。</li>
+      <li>调小 <code>tcp_fin_timeout</code> 不影响 TIME_WAIT，只影响 FIN_WAIT_2，别答错。</li>
+      <li>真正的解法是<strong>减少短连接</strong>，不是调参数。</li>
+    </ul>
+    <p><strong>追问：</strong>TIME_WAIT 会不会占满端口？—— 会。主动连接方用尽 <code>ip_local_port_range</code> 后无法建新连接，报 <code>Cannot assign requested address</code>。这时看的是<strong>本机作为客户端</strong>的连接行为。</p>
+
+    <h2 id="cong">拥塞控制</h2>
+
+    <h3 id="aimd">慢启动、拥塞避免、快重传、快恢复</h3>
+    <p><strong>会问：</strong>cwnd 和 ssthresh 怎么变？为什么超时和 3 个 dup ACK 的惩罚不一样？</p>
+    <ul>
+      <li><strong>慢启动</strong>（<code>cwnd &lt; ssthresh</code>）：每收一个 ACK，<code>cwnd += 1 MSS</code>，效果是<strong>每个 RTT 翻倍</strong>。起点是 IW10 = 10 MSS。</li>
+      <li><strong>拥塞避免</strong>（<code>cwnd ≥ ssthresh</code>）：每 RTT <code>+1 MSS</code>，线性增长（AIMD 的加性增）。</li>
+      <li><strong>超时</strong>：<code>ssthresh = cwnd / 2</code>，<code>cwnd = 1 MSS</code>，回到慢启动。最重的惩罚。</li>
+      <li><strong>快重传</strong>：收到 3 个重复 ACK，立刻重传缺失段，不等 RTO。</li>
+      <li><strong>快恢复</strong>：<code>ssthresh = FlightSize / 2</code>，<code>cwnd = ssthresh + 3 MSS</code>（3 个 dup ACK 代表 3 个包已离开网络），然后进入拥塞避免。</li>
+    </ul>
+    <p>
+      <strong>为什么区别对待：</strong>超时意味着连 ACK 都回不来了，网络可能严重拥塞；而 3 个 dup ACK 说明后续包还在到达，
+      网络只是丢了个别包，所以没必要退到 1。
+    </p>
+    <pre><code><span class="c"># Reno 的 cwnd 轨迹（白板要能画）</span>
+      超时:      ssthresh=cwnd/2, cwnd=1
+   3 dup ACK:     ssthresh=cwnd/2, cwnd=ssthresh+3MSS
+   每 RTT:        slow start 翻倍 → 到达 ssthresh → 每 RTT +1 MSS</code></pre>
+    <p><strong>追问：</strong>SACK 改变了什么？—— 接收方通过 SACK option 报告收到的区间，发送方一个 RTT 可以补多个洞；没有 SACK 时（NewReno）一个 RTT 通常只能恢复一个丢包。</p>
+
+    <h3 id="cubic-bbr">Reno → CUBIC → BBR：差在「用什么信号判断拥塞」</h3>
+    <p><strong>会问：</strong>Linux 默认是什么？BBR 和 CUBIC 的本质区别？</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>算法</th><th>拥塞信号</th><th>窗口增长</th><th>问题/场景</th></tr></thead>
+        <tbody>
+          <tr><td>Reno</td><td>丢包</td><td>AIMD，每 RTT +1 MSS</td><td>高 BDP 下恢复太慢</td></tr>
+          <tr><td><strong>CUBIC</strong>（Linux 默认）</td><td>丢包</td><td>以「上次拥塞点」为锚的三次函数，<strong>与 RTT 无关</strong></td><td>把非拥塞丢包误判为拥塞</td></tr>
+          <tr><td><strong>BBR</strong></td><td><strong>不靠丢包</strong>，靠带宽和 RTT 估计</td><td>维持 <code>cwnd = BtlBw × RTprop</code>，用 pacing 控制发送节奏</td><td>与其他 BBR 流竞争公平性有争议；浅 buffer 下优势明显</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      CUBIC 解决的问题：Reno 的窗口增长依赖 RTT，RTT 越长增长越慢，导致同一条链路上短 RTT 流占便宜。
+      CUBIC 改成按<strong>时间</strong>增长，并且靠近上次拥塞点时增长慢、远离时增长快。
+    </p>
+    <p>
+      BBR 解决的问题：<strong>丢包 ≠ 拥塞</strong>。它周期性地测量两个量：
+      <code>BtlBw</code>（一段时间内 ACK 反映出的最大交付速率）和 <code>RTprop</code>（一段时间内的最小 RTT，
+      即排队为空的物理时延），然后让在途数据量贴着 <code>BDP = BtlBw × RTprop</code>，并加一点 pacing。
+    </p>
+    <div class="box warn">
+      <span class="box-title">为什么数据中心/长肥管道偏爱 BBR</span>
+      交换机 buffer 浅，CUBIC 一丢包就砍半，吞吐周期性塌陷；BBR 不把丢包当信号，能把排队压到很低同时保持吞吐。
+      但在<strong>有随机丢包的无线链路</strong>上，BBR 也可能过度乐观；在完全无损的 IB 网络上，瓶颈根本不在拥塞控制。
+      <strong>没有银弹，只有权衡。</strong>
+    </div>
+    <p><strong>追问：</strong>怎么查看和切换？—— <code>sysctl net.ipv4.tcp_congestion_control</code>，可用的在 <code>/proc/sys/net/ipv4/tcp_available_congestion_control</code>；<code>ss -i</code> 能看到每条连接的 cwnd、rtt、拥塞算法。</p>
+
+    <h2 id="flow">流量控制 vs 拥塞控制</h2>
+
+    <h3 id="rwnd-cwnd">min(rwnd, cwnd)</h3>
+    <p><strong>会问：</strong>两者保护的对象有什么不同？发送窗口到底取哪个？</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>流量控制</th><th>拥塞控制</th></tr></thead>
+        <tbody>
+          <tr><td>保护</td><td>接收方的 socket 缓冲区</td><td>网络链路和中间设备</td></tr>
+          <tr><td>信号</td><td>TCP 头 <code>window</code> 字段（显式）</td><td>丢包 / dup ACK / RTT（隐式）</td></tr>
+          <tr><td>变量</td><td><code>rwnd</code>，接收方决定</td><td><code>cwnd</code>，发送方估计</td></tr>
+          <tr><td>失效后果</td><td>接收缓冲溢出丢包</td><td>网络拥塞崩溃</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>发送方在途数据量满足 <code>inflight ≤ min(cwnd, rwnd)</code>。滑动窗口的左边界是 <code>snd_una</code>（最早未确认），右边界是 <code>snd_una + min(cwnd, rwnd)</code>。</p>
+    <p><strong>追问：</strong><code>rwnd</code> 是怎么算出来的？—— 接收方用「socket 接收缓冲区剩余空间」减去一些保留量，再按 window scaling 右移后填进 16 位字段。缓冲区越小，窗口越小，吞吐上限 = <code>rwnd / RTT</code>。</p>
+
+    <h3 id="sws">零窗口探测与糊涂窗口综合征</h3>
+    <p><strong>会问：</strong>接收缓冲满了会怎样？什么是 SWS？Nagle 和延迟 ACK 为什么要小心一起用？</p>
+    <ul>
+      <li><strong>零窗口</strong>：接收方通告 <code>window=0</code>，发送方停止发送。之后接收方腾出空间时发的 window update 可能丢失，
+      所以发送方用 <strong>zero window probe</strong> 定时发 1 字节探测，逼对方回当前窗口。</li>
+      <li><strong>SWS（糊涂窗口）</strong>：接收方每次只腾出几字节就通告，发送方就发一个「头 40 字节、载荷几字节」的小包。
+      对策两端都有：接收方等窗口够大（或超时）再通告；发送方用 <strong>Nagle</strong> 合并小包。</li>
+      <li><strong>Nagle + 延迟 ACK</strong>：发送方等 ACK 才发下一个包，接收方等 40 ms 攒够再 ACK，两者叠加会造成明显延迟。
+      这就是低延迟 RPC 设 <code>TCP_NODELAY</code> 的原因。</li>
+    </ul>
+    <p><strong>追问：</strong>什么时候该关 Nagle？—— 小消息、低延迟、请求-响应模式的协议（Redis、gRPC、游戏）关；大块批量传输保持开启，让内核合并。</p>
+
+    <h2 id="kernel-stack">Linux 内核网络栈（重点）</h2>
+
+    <h3 id="skb">sk_buff：为什么能前后伸缩</h3>
+    <p><strong>会问：</strong>一个报文在内核里是什么结构？为什么要预留 headroom？</p>
+    <p>
+      整个内核网络栈用一个 <code>struct sk_buff</code> 表示一个报文，从驱动收到应用读走，都是同一个 skb 在流动。
+      关键是指针：
+    </p>
+    <pre><code><span class="k">struct</span> sk_buff {
+    <span class="k">char</span> *head, *data, *tail, *end;  <span class="c">// 缓冲区起止 + 当前数据起止</span>
+    <span class="k">unsigned</span> <span class="k">int</span> len;              <span class="c">// 总长度</span>
+    <span class="k">struct</span> sock *sk;               <span class="c">// 关联的 socket（后段才有）</span>
+    <span class="k">struct</span> skb_shared_info *shinfo; <span class="c">// 尾部：frags、GSO 信息</span>
+};</code></pre>
+    <ul>
+      <li><code>skb_reserve()</code>：把 <code>data</code>/<code>tail</code> 同时后移，预留头部空间（收包时一次留够 L2/L3/L4 的头）。</li>
+      <li><code>skb_push()</code> / <code>skb_pull()</code>：在头部加 / 去一层协议头，<strong>只是移动 <code>data</code> 指针，O(1)，不搬数据</strong>。</li>
+      <li><code>skb_put()</code> / <code>skb_trim()</code>：在尾部加 / 减数据。</li>
+    </ul>
+    <p>
+      没有 headroom 的话，每封装一层头都要重新分配并拷贝整个报文。有了它，一个包从驱动到应用可以做到
+      「分配一次、只改指针」。<code>skb_push</code> 还能往回推，是因为分配时就多要了空间（<code>NET_SKB_PAD</code> 等）。
+    </p>
+    <p><strong>追问：</strong>大块 payload 也存在线性区吗？—— 不。大块数据挂在 <code>skb_shared_info.frags[]</code>，指向 page，线性区只放头部和小段数据。这就是「零拷贝」的雏形，<code>sendpage</code>/<code>MSG_SPLICE_PAGES</code> 都走这里。</p>
+
+    <h3 id="rx-path">收包路径：网卡 → DMA → 中断 → NAPI → 协议栈 → socket</h3>
+    <p><strong>会问：</strong>一个包从网线到 <code>recv()</code> 返回，中间发生了什么？中断和轮询怎么配合？</p>
+    <ol>
+      <li><strong>DMA 写入 RX ring。</strong>驱动预分配一组描述符（descriptor），每块指向 DMA 缓冲区。网卡收到帧后自己写内存，<strong>CPU 不参与搬运</strong>。</li>
+      <li><strong>硬中断（top half）。</strong>中断处理只做最少的：关掉该设备的 RX 中断，调用 <code>napi_schedule()</code>，把 NAPI 实例挂到 per-CPU 的 poll 链表，触发 <code>NET_RX_SOFTIRQ</code>。</li>
+      <li><strong>NAPI poll（软中断）。</strong><code>net_rx_action</code> 调驱动的 <code>poll()</code>，一次最多处理 <strong>weight（默认 64）</strong> 个包；整轮软中断受 <code>netdev_budget</code>（默认 300 包）和 <code>netdev_budget_usecs</code>（默认 2 ms）限制。收完才重新开中断。</li>
+      <li><strong><code>netif_receive_skb()</code></strong> 进入协议栈，按 EtherType 分发 → <code>ip_rcv()</code> → 路由/校验/分片重组 → <code>tcp_v4_rcv()</code>。</li>
+      <li><strong>TCP 层用四元组哈希找到 <code>struct sock</code></strong>，把 skb 挂进 <code>sk_receive_queue</code>，调 <code>sk_data_ready()</code> 唤醒等待的进程。</li>
+      <li><strong>用户态 <code>recv()</code></strong> 被调度后 <code>copy_to_user()</code> 把数据拷到用户缓冲区。</li>
+    </ol>
+    <pre><code>NIC ──DMA──► RX ring ──IRQ──► napi_schedule()
+   ──softirq NET_RX_SOFTIRQ──► poll(weight=64)
+   ──► netif_receive_skb ──► ip_rcv ──► tcp_v4_rcv
+   ──► sk_receive_queue ──► sk_data_ready() ──► 唤醒 recv()</code></pre>
+    <div class="box">
+      <span class="box-title">为什么是「中断 + 轮询」的混合</span>
+      纯中断：低 PPS 时延迟低，但高 PPS 下每包一次中断，CPU 全花在进中断上（中断风暴）。
+      纯轮询：高 PPS 时高效，但低 PPS 时空转。
+      NAPI 的做法是<strong>第一个包用中断唤醒，之后关中断批量轮询，收完再开</strong>——
+      低负载像中断，高负载像轮询。
+    </div>
+    <p><strong>追问：</strong>多核怎么并行收包？—— 网卡多队列（RSS）按四元组哈希把连接分到不同 queue，每个 queue 配一个 CPU，用 IRQ affinity 绑定。单队列网卡只能一个 CPU 收，是高 PPS 场景的第一瓶颈。</p>
+
+    <h3 id="tx-path">发包路径（简述）</h3>
+    <p><strong>会问：</strong><code>write()</code> 到网卡之间做了什么？TSO 省了什么？</p>
+    <p>
+      <code>write()</code> 拷进 socket 发送缓冲区 → TCP 按 <code>min(cwnd, rwnd)</code> 取数据、加头、生成 skb →
+      IP 查路由、必要时分片 → 邻居子系统填 MAC → 驱动 <code>ndo_start_xmit</code> 把描述符挂到 TX ring →
+      网卡 DMA 读出并发送 → 发送完成中断回收缓冲区。
+    </p>
+    <p>
+      <strong>TSO/GSO</strong>：内核把大块数据（最大约 64 KB）直接交给网卡，由硬件切成 MSS 大小的包，
+      省掉内核里的分段。驱动的 <code>xmit_more</code> 允许一次提交多个 skb 才敲 doorbell，减少 MMIO。
+    </p>
+    <p><strong>追问：</strong>为什么发包不像收包那样用 NAPI？—— 发送由应用驱动，天然有节奏；收包是外部事件驱动，才需要中断/轮询的混合。</p>
+
+    <h3 id="queues">几个「队列」，别搞混</h3>
+    <p><strong>会问：</strong>backlog 队列、accept 队列、SYN 队列、ring buffer 分别在哪？满了什么现象？</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>队列</th><th>位置</th><th>大小参数</th><th>满了的表现</th></tr></thead>
+        <tbody>
+          <tr><td>RX ring</td><td>网卡/驱动 DMA 内存</td><td><code>ethtool -g</code>，典型 256–4096 描述符</td><td>网卡丢包，<code>rx_dropped</code>/<code>rx_missed</code> 增长</td></tr>
+          <tr><td>backlog（per-CPU）</td><td>软中断输入队列</td><td><code>net.core.netdev_max_backlog</code>（默认 1000）</td><td>内核丢包，<code>/proc/net/softnet_stat</code> 的 drop 列增长</td></tr>
+          <tr><td>半连接（SYN_RCVD）</td><td>TCP 层，未完成握手</td><td><code>tcp_max_syn_backlog</code></td><td>新 SYN 被丢，客户端超时重传</td></tr>
+          <tr><td>accept 队列</td><td>TCP 层，已完成握手待 accept</td><td><code>min(somaxconn, listen(fd, backlog))</code></td><td><code>tcp_abort_on_overflow=0</code> 时静默丢 ACK，客户端「连上了但不响应」</td></tr>
+          <tr><td>socket 接收队列</td><td>每个 <code>struct sock</code></td><td><code>SO_RCVBUF</code> / <code>tcp_rmem</code></td><td>窗口降为 0，发送方停发</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="box danger">
+      <span class="box-title">经典事故</span>
+      <code>listen(fd, 128)</code> 而 <code>somaxconn=4096</code>，实际 accept 队列是 <strong>128</strong>。
+      突发流量下溢出，内核默认静默丢弃 ACK，客户端认为连接成功、请求却超时。
+      看 <code>netstat -s | grep -i listen</code> 的 overflow 计数。<strong>修复：<code>listen(fd, SOMAXCONN)</code> 并调大 <code>somaxconn</code>。</strong>
+    </div>
+    <p>
+      <strong>SO_RCVBUF 的坑：</strong>默认开启自动调优（<code>tcp_moderate_rcvbuf=1</code>），缓冲在 <code>tcp_rmem[1]</code> 和
+      <code>[2]</code> 之间按 BDP 伸缩。<strong>一旦手动 <code>setsockopt(SO_RCVBUF)</code>，自动调优就被关掉</strong>，
+      窗口固定，长肥管道下吞吐会掉。正确做法通常是只调 <code>tcp_rmem</code> 的上限，别动 socket 选项。
+    </p>
+    <p><strong>追问：</strong>怎么确认丢在哪个队列？—— ring：<code>ethtool -S</code>；backlog：<code>softnet_stat</code> 第三列；accept 溢出：<code>netstat -s</code> 的 listen overflows。</p>
+
+    <h2 id="zero-copy">零拷贝与高性能 IO</h2>
+
+    <h3 id="copy-count">4 次、3 次、2 次</h3>
+    <p><strong>会问：</strong><code>read</code>+<code>write</code> 发文件拷了几次？<code>sendfile</code> 省了哪次？</p>
+    <pre><code>read():  磁盘 ──DMA──► page cache ──CPU──► 用户 buf
+write(): 用户 buf ──CPU──► socket buf ──DMA──► 网卡
+<span class="c">// 4 次拷贝（2 次 DMA + 2 次 CPU），4 次用户/内核切换</span></code></pre>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>方式</th><th>拷贝</th><th>切换</th><th>关键点</th></tr></thead>
+        <tbody>
+          <tr><td><code>read</code> + <code>write</code></td><td>4</td><td>4</td><td>数据在用户态兜一圈</td></tr>
+          <tr><td><code>mmap</code> + <code>write</code></td><td>3</td><td>4</td><td>省掉「内核 → 用户」那次 CPU 拷贝</td></tr>
+          <tr><td><code>sendfile</code></td><td>3（SG-DMA 时 2）</td><td>2</td><td>不经过用户态；数据从 page cache 直接进 socket buffer</td></tr>
+          <tr><td><code>splice</code> / <code>tee</code></td><td>取决于路径</td><td>2</td><td>以 pipe 为中转，传的是 page 引用；<code>tee</code> 是复制管道内容而不消费</td></tr>
+          <tr><td><code>MSG_ZEROCOPY</code></td><td>发送侧 0 次 CPU 拷贝</td><td>2</td><td>用户页 pin 住后直接 DMA；完成通知走 socket error queue</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>追问：</strong>为什么说 zero-copy 不是「零」？—— DMA 拷贝还在，只是不占 CPU。省掉的是「CPU 参与的拷贝」和「上下文切换」。真正的零拷贝只能让计算靠近数据（GPU/DPU）。</p>
+
+    <h3 id="sendfile-splice">sendfile 与 splice</h3>
+    <p><strong>会问：</strong>写一段 sendfile 的代码？它和 splice 怎么选？</p>
+    <pre><code><span class="c">// 文件 → socket，一次系统调用</span>
+<span class="k">ssize_t</span> n = sendfile(sock_fd, file_fd, &amp;offset, count);
+
+<span class="c">// 两个 fd 之间中转，必须有一端是 pipe</span>
+splice(file_fd, &amp;off_in, pipefd[<span class="n">1</span>], NULL, len, SPLICE_F_MOVE);
+splice(pipefd[<span class="n">0</span>], NULL, sock_fd, NULL, len, SPLICE_F_MOVE);</code></pre>
+    <p>
+      <code>sendfile</code> 适合「文件 → socket」的静态文件服务（Nginx）；<code>splice</code> 适合任意两个 fd 之间转发（代理）。
+      两者都避免数据进入用户态。<strong>如果网卡支持 SG-DMA</strong>，内核可以把 page cache 的页直接交给网卡，
+      连进 socket buffer 的那次拷贝都省了。
+    </p>
+    <p><strong>追问：</strong><code>sendfile</code> 的 in_fd 能是 socket 吗？—— 不能，in_fd 必须是支持 mmap 的文件；要把 socket 数据写到文件，用 <code>splice</code> 或用户态中转。</p>
+
+    <h3 id="dpdk-xdp">DPDK 与 XDP：两种「绕过内核」</h3>
+    <p><strong>会问：</strong>两者都很快，区别是什么？</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>DPDK</th><th>XDP</th></tr></thead>
+        <tbody>
+          <tr><td>位置</td><td>用户态，完全接管网卡（UIO/VFIO + PMD）</td><td>内核内，驱动 NAPI poll 的最早点（分配 skb 之前）</td></tr>
+          <tr><td>数据路径</td><td>用户态 busy-poll，无中断、无系统调用</td><td>eBPF 程序返回 PASS/DROP/TX/REDIRECT</td></tr>
+          <tr><td>CPU</td><td>独占核 100% 轮询</td><td>共享，按需执行</td></tr>
+          <tr><td>典型场景</td><td>NFV、5G UPF、高频交易</td><td>DDoS 清洗、L4 负载均衡、可观测性</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>一句话：</strong>XDP 是「在内核里尽早处理」，DPDK 是「不要内核」。DPDK 快是因为省掉了中断、系统调用、协议栈、切换和拷贝，代价是独占 CPU 和网卡。</p>
+    <p><strong>追问：</strong>XDP 能收包到用户态吗？—— 能，配合 <code>AF_XDP</code> socket，用 UMEM 做零拷贝或拷贝模式。这是 XDP 和 DPDK 之间的折中。</p>
+
+    <h2 id="epoll">epoll 与 IO 多路复用</h2>
+
+    <h3 id="compare">select / poll / epoll</h3>
+    <p><strong>会问：</strong>epoll 为什么快？是红黑树快吗？</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>select</th><th>poll</th><th>epoll</th></tr></thead>
+        <tbody>
+          <tr><td>fd 上限</td><td><code>FD_SETSIZE</code>，默认 1024</td><td>无硬上限</td><td>无硬上限（受 <code>RLIMIT_NOFILE</code>）</td></tr>
+          <tr><td>每次调用</td><td>拷贝位图 + 遍历 O(n)</td><td>拷贝数组 + 遍历 O(n)</td><td><code>epoll_wait</code> 只取就绪的 O(k)</td></tr>
+          <tr><td>内核结构</td><td>无持久状态</td><td>无持久状态</td><td>红黑树 + 就绪链表</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <strong>快的两个真正原因：</strong>① 注册只做一次（<code>epoll_ctl</code>），<code>epoll_wait</code> 不再拷贝和扫描全量 fd；
+      ② 就绪事件由内核回调主动挂到链表，<code>epoll_wait</code> 只返回就绪的。
+      红黑树只是「fd → epitem」的索引，换成哈希表也一样快 —— 面试时能主动说这一点，比背「红黑树」高一个层次。
+    </p>
+    <p><strong>追问：</strong>epoll 一定比 select 快吗？—— 连接很少且都很活跃时，select 的额外开销可以忽略，epoll 的系统调用次数反而更多。epoll 赢在「连接多、活跃少」。</p>
+
+    <h3 id="internals">红黑树 + 就绪链表</h3>
+    <p><strong>会问：</strong>描述一下 epoll 的内核数据结构与事件流转。</p>
+    <pre><code><span class="k">struct</span> eventpoll {
+    <span class="k">struct</span> rb_root   rbr;      <span class="c">// 所有注册的 fd</span>
+    <span class="k">struct</span> list_head rdllist; <span class="c">// 已就绪的 epitem</span>
+    <span class="k">struct</span> wait_queue_head wq; <span class="c">// 阻塞在 epoll_wait 的进程</span>
+};</code></pre>
+    <ol>
+      <li><code>epoll_create</code> 创建 <code>eventpoll</code>，初始化红黑树和就绪链表。</li>
+      <li><code>epoll_ctl(ADD)</code> 把 fd 包成 <code>epitem</code> 插入红黑树，并在该 fd 的等待队列上注册 <code>ep_poll_callback</code>。</li>
+      <li>数据到达 → 回调触发 → <code>epitem</code> 链入 <code>rdllist</code> → 唤醒 <code>epoll_wait</code>。</li>
+      <li><code>epoll_wait</code> 把 <code>rdllist</code> 里的事件拷到用户数组并返回。</li>
+    </ol>
+    <p><strong>追问：</strong>同一个 fd 同时注册在多个 epoll 实例里会怎样？—— 每个实例各有一个 epitem、各注册一次回调，事件会分别挂到各自的就绪链表。可以，但注意回调开销和复杂度。</p>
+
+    <h3 id="lt-et">LT vs ET：ET 必须读到 EAGAIN</h3>
+    <p><strong>会问：</strong>两者区别？ET 模式怎么写才对？为什么 ET 必须非阻塞？</p>
+    <ul>
+      <li><strong>LT（默认）</strong>：只要 fd 还有数据，每次 <code>epoll_wait</code> 都返回它。读不完下次还提醒，安全。</li>
+      <li><strong>ET</strong>：只在状态<strong>变化</strong>时通知一次（无数据 → 有数据）。没读完就<strong>不会再收到通知</strong>。</li>
+    </ul>
+    <pre><code><span class="c">// ET：fd 必须 O_NONBLOCK</span>
+<span class="k">int</span> fl = fcntl(fd, F_GETFL);
+fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+<span class="k">struct</span> epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.fd = fd };
+epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &amp;ev);
+
+<span class="c">// 读循环：必须读到 EAGAIN</span>
+<span class="k">for</span> (;;) {
+    <span class="k">ssize_t</span> n = read(fd, buf, <span class="k">sizeof</span> buf);
+    <span class="k">if</span> (n &gt; <span class="n">0</span>) { handle(buf, n); <span class="k">continue</span>; }
+    <span class="k">if</span> (n == <span class="n">0</span>) { close(fd); <span class="k">break</span>; }              <span class="c">// EOF</span>
+    <span class="k">if</span> (errno == EAGAIN || errno == EWOULDBLOCK) <span class="k">break</span>; <span class="c">// 读干净</span>
+    <span class="k">if</span> (errno == EINTR) <span class="k">continue</span>;
+    close(fd); <span class="k">break</span>;                                <span class="c">// 真错误</span>
+}</code></pre>
+    <div class="box danger">
+      <span class="box-title">为什么必须非阻塞</span>
+      ET 要求「一次读干净」，判断读干净的唯一办法是 <code>read()</code> 返回 <code>EAGAIN</code>。
+      如果 fd 是阻塞的，最后一次 <code>read()</code> 会<strong>挂起整个事件循环</strong>，等不到 <code>EAGAIN</code>。
+    </div>
+    <p>
+      写也一样：写缓冲满时 <code>write()</code> 返回 <code>EAGAIN</code>，要把剩余数据存进应用缓冲，
+      等 <code>EPOLLOUT</code> 再继续。<strong>ET 的正确性完全由应用负责</strong>，所以新服务优先用 LT。
+    </p>
+    <p><strong>追问：</strong>LT 会不会重复通知导致忙？—— 会。如果 fd 上一直有数据而你不读，<code>epoll_wait</code> 会一直返回。但只要你读，它就会停；这比 ET 漏读导致连接卡死容易排查得多。</p>
+
+    <h3 id="thundering-herd">惊群与 EPOLLEXCLUSIVE</h3>
+    <p><strong>会问：</strong>多个线程 <code>epoll_wait</code> 同一个 epfd 会怎样？怎么解决？</p>
+    <p>
+      一个事件到来时，所有等待在同一个 <code>eventpoll</code> 上的进程/线程都会被唤醒，但只有一个能处理，
+      其余白醒一次 —— 线程越多，上下文切换浪费越大。
+    </p>
+    <ul>
+      <li><code>EPOLLEXCLUSIVE</code>（4.5+）：<code>epoll_ctl</code> 时加上，内核<strong>只唤醒一个</strong>等待者。</li>
+      <li><code>SO_REUSEPORT</code>：每个线程一个 epfd、各自监听同一端口，内核按四元组哈希分发连接，从根上不共享 epfd。</li>
+      <li>Reactor 模型：主线程 accept 后分发给 worker（Nginx / Netty 的思路）。</li>
+    </ul>
+    <p><strong>追问：</strong><code>EPOLLEXCLUSIVE</code> 能和其他 flag 一起用吗？—— 可以和 <code>EPOLLIN</code>、<code>EPOLLET</code> 等组合；<strong>不能与 <code>EPOLLONESHOT</code> 同用</strong>，也不能用于 <code>EPOLL_CTL_MOD</code>，否则 <code>epoll_ctl</code> 返回 <code>EINVAL</code>。</p>
+
+    <h2 id="rdma">RDMA 与分布式训练</h2>
+
+    <h3 id="why-rdma">为什么 RDMA 快</h3>
+    <p><strong>会问：</strong>RDMA 比 TCP 快在哪？三个特征说说。</p>
+    <ul>
+      <li><strong>Kernel bypass</strong>：<code>ibv_post_send</code> 在用户态直接写网卡 doorbell（mmap 的 BAR 寄存器），没有系统调用、不陷入内核。</li>
+      <li><strong>Zero-copy</strong>：数据在注册过的内存（MR）和网卡之间直接 DMA，不经过内核缓冲区。</li>
+      <li><strong>CPU 不参与</strong>：可靠性、重传、排序都卸载到网卡；完成事件由网卡写 CQ，用户态 <code>ibv_poll_cq()</code> 轮询，没有中断。</li>
+    </ul>
+    <p>代价：需要专用网卡、无损网络、内存注册（pin 页）开销大、编程模型复杂。</p>
+    <p><strong>追问：</strong>MR 为什么要 pin 页？—— 网卡 DMA 用的是物理地址，页被换出或迁移会导致 DMA 写到错误位置。注册时锁页并建立地址翻译表，之后网卡才能安全访问。</p>
+
+    <h3 id="ib-roce">InfiniBand vs RoCE v2 vs iWARP</h3>
+    <p><strong>会问：</strong>RoCE v2 跑在哪？为什么要求无损网络？</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>InfiniBand</th><th>RoCE v2</th><th>iWARP</th></tr></thead>
+        <tbody>
+          <tr><td>承载</td><td>IB 专用链路（非以太网）</td><td>以太网 + UDP/IP，端口 4791</td><td>以太网 + TCP/IP</td></tr>
+          <tr><td>无损</td><td>原生（credit-based 流控）</td><td><strong>要配 PFC / ECN</strong></td><td>不需要</td></tr>
+          <tr><td>现状</td><td>HPC / 大模型训练主流</td><td>云厂商主流，复用现网</td><td>基本退出主流</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      RoCE 把可靠传输卸载到网卡，网卡的重传缓冲是固定的。交换机一丢包，重传风暴会放大拥塞，
+      所以要求 PFC 做到「不丢包」，再用 ECN 标记拥塞、让发送端降速。
+      <strong>RoCE 比 IB 便宜，但运维复杂度高</strong> —— 配置出错就是性能断崖。
+    </p>
+    <p><strong>追问：</strong>PFC 有什么副作用？—— 可能造成「死锁」和「拥塞扩散」（pause 帧风暴），所以有 watchdog 和 PFC storm 检测。这也是云厂商推拥塞控制型无损（如 DCQCN）的原因。</p>
+
+    <h3 id="verbs">verbs 编程模型：PD / MR / QP / CQ</h3>
+    <p><strong>会问：</strong>RDMA 的编程对象有哪些？一次 Send 的流程？</p>
+    <ul>
+      <li><strong>PD</strong>：保护域，QP 和 MR 必须同域才能互访。</li>
+      <li><strong>MR</strong>：注册过的内存，拿到 <code>lkey</code>/<code>rkey</code>。</li>
+      <li><strong>QP</strong>：一对 Send/Recv 队列，本质是环。连接 = 一对 QP。</li>
+      <li><strong>CQ</strong>：完成队列，网卡写 CQE，用户轮询。</li>
+    </ul>
+    <pre><code>mr = ibv_reg_mr(pd, buf, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+
+<span class="k">struct</span> ibv_send_wr wr = {
+    .opcode = IBV_WR_SEND,
+    .sg_list = &amp;sge, .num_sge = <span class="n">1</span>,
+    .send_flags = IBV_SEND_SIGNALED,
+};
+ibv_post_send(qp, &amp;wr, &amp;bad_wr);   <span class="c">// 用户态直接写 doorbell</span>
+
+<span class="k">while</span> (ibv_poll_cq(cq, <span class="n">1</span>, &amp;wc) == <span class="n">0</span>) { <span class="c">/* spin */</span> }</code></pre>
+    <p>
+      <strong>Send/Recv 是双边</strong>：接收端必须提前 post recv。<strong>Read/Write 是单边</strong>：对方不需要参与，
+      只需要提供 <code>rkey</code> 和远端地址 —— 这是 RDMA 最强大的地方，也是内存保护必须严格的原因。
+    </p>
+    <p><strong>追问：</strong>为什么轮询而不是中断？—— 中断的延迟（微秒级）比 RDMA 的传输时间还大。高吞吐场景用 busy-poll，用一点 CPU 换延迟；低负载可以设 completion channel 用事件通知。</p>
+
+    <h3 id="nccl">NCCL 与 Ring AllReduce</h3>
+    <p><strong>会问：</strong>Ring AllReduce 怎么走？带宽怎么算？</p>
+    <p>N 个 GPU 排成环，数据切成 N 份，两个阶段：</p>
+    <ol>
+      <li><strong>Reduce-Scatter</strong>：走 N−1 步，每步传一份，边传边累加，结束时每个 GPU 持有其中一份的完整和。</li>
+      <li><strong>All-Gather</strong>：再走 N−1 步，把各份和广播给所有人。</li>
+    </ol>
+    <pre><code>S = 总数据量，N = GPU 数
+每步传输     = S / N
+总步数       = 2(N − 1)
+每 GPU 总量  = 2(N − 1) / N × S
+
+algbw = S / t
+busbw = algbw × 2(N − 1) / N     <span class="c">// NCCL 报的 busbw</span></code></pre>
+    <p>
+      <strong>为什么乘这个系数：</strong>Ring 的带宽下界就是 <code>2(N−1)/N × S</code>。NCCL 的 busbw 定义为
+      「假设网络带宽被完全利用时的等效值」，所以判断是否跑满物理带宽，看 <strong>busbw</strong>，不是 algbw。
+    </p>
+    <p>
+      举例：8 卡、物理带宽 100 GB/s、S = 1 GB，理论最短时间 ≈ <code>2×7/8 × 1 GB / 100 GB/s</code> ≈ 17.5 ms。
+      实测 20 ms 就是约 87% 效率。
+    </p>
+    <p><strong>追问：</strong>Ring 和 Tree 怎么选？—— Ring 带宽最优但步数 2(N−1)，大消息用它；Tree 是 O(log N) 步，延迟低，小消息用它。NCCL 按消息大小和拓扑自动切换。</p>
+
+    <h3 id="gpudirect">GPUDirect RDMA 与 NVLink 的层次</h3>
+    <p><strong>会问：</strong>GPUDirect 省了什么？NVLink 和 IB 是什么关系？</p>
+    <p>
+      普通 RDMA 是「网卡 ↔ 主存」。GPUDirect RDMA 让网卡<strong>直接 DMA 读写显存</strong>：
+      路径从「GPU → 主存 → 网卡」变成「GPU → 网卡」，省掉一次 PCIe 往返和一次 CPU 拷贝。
+      实现上由 <code>nvidia-peermem</code> 模块把显存页注册给网卡。
+    </p>
+    <ul>
+      <li><strong>NVLink</strong>：单机内 GPU 之间的互连，带宽远高于 PCIe。</li>
+      <li><strong>NVSwitch</strong>：把 NVLink 做成交换芯片，让机内多卡两两满带宽。</li>
+      <li><strong>InfiniBand / RoCE</strong>：机器之间的网络。</li>
+    </ul>
+    <p>大模型训练的分层很清晰：<strong>机内 AllReduce 走 NVLink/NVSwitch，跨机走 IB/RoCE + GPUDirect</strong>，数据全程不经过 CPU 主存。</p>
+    <p><strong>追问：</strong>GPUDirect 需要什么条件？—— 支持 P2P 的 GPU、支持 GPUDirect 的网卡、正确的 PCIe 拓扑（同一 PCIe switch 或支持 ACS 转发），以及驱动模块加载。拓扑不对时性能会回退到经过主存。</p>
+
+    <h2 id="qa">高频问答</h2>
+    <p>八个问题，覆盖上面 80% 的考点。建议合上页面，对着白板默写。</p>
+
+    <details class="qa">
+      <summary>三次握手为什么不能两次？</summary>
+      <div class="a">
+        <p>两次握手时，服务端发完 SYN-ACK 就认为连接建立，<strong>无法确认客户端收到了它</strong>。SYN-ACK 丢失会让服务端单方面分配资源、客户端却在重传 SYN，双方状态不一致。</p>
+        <p>同时，两次握手下，网络里滞留的旧 SYN 可能让服务端建立一个客户端根本不知道的连接。第三次 ACK（以及随机 ISN）让客户端有机会拒绝。</p>
+        <p>四次可以，但没必要：三次已经是「双向确认」的最少次数。</p>
+        <p><strong>追问：</strong>第三次 ACK 丢了怎么办？—— 服务端在 SYN_RCVD 会重传 SYN-ACK；客户端此时已 ESTABLISHED，收到重传的 SYN-ACK 会再回 ACK。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>TIME_WAIT 有什么用？太多怎么办？CLOSE_WAIT 呢？</summary>
+      <div class="a">
+        <p><strong>TIME_WAIT（2MSL = 60 s，Linux 写死）：</strong></p>
+        <ul>
+          <li>保证最后的 ACK 能到达：ACK 丢了，对端重传 FIN，还在 TIME_WAIT 的一方可以重新 ACK。</li>
+          <li>让旧连接的报文彻底消失，避免污染相同四元组的新连接。</li>
+        </ul>
+        <p><strong>太多：</strong>本质是短连接太多。用连接池 / keep-alive；客户端侧 <code>tcp_tw_reuse=1</code>（需 timestamp）；服务端 <code>SO_REUSEADDR</code>。不要提 <code>tcp_tw_recycle</code>（4.12 已移除），调 <code>tcp_fin_timeout</code> 也没用（它管 FIN_WAIT_2）。</p>
+        <p><strong>CLOSE_WAIT 堆积：</strong>完全不同 —— 对端发了 FIN，本机回了 ACK，但<strong>应用没有 close()</strong>。这是连接泄漏，改代码，不是调参数。</p>
+        <p><strong>追问：</strong>TIME_WAIT 会不会导致端口耗尽？—— 会。本机作为客户端时，主动连接用尽临时端口范围，报 <code>Cannot assign requested address</code>。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>epoll ET 模式怎么正确读写？</summary>
+      <div class="a">
+        <ol>
+          <li>fd 设为 <code>O_NONBLOCK</code>。</li>
+          <li>读循环必须读到 <code>EAGAIN</code>；返回 0 是 EOF，关闭；其他错误关闭。</li>
+          <li>写循环处理 <code>EAGAIN</code>：剩余数据进应用缓冲，注册 <code>EPOLLOUT</code>，等可写再继续。</li>
+          <li>监听 <code>EPOLLERR</code>/<code>EPOLLHUP</code>，即使没注册这两个事件它们也可能被报告。</li>
+        </ol>
+        <p><strong>为什么必须非阻塞：</strong>判断「读干净」只能靠 <code>EAGAIN</code>；阻塞 fd 会挂起事件循环。</p>
+        <p><strong>为什么 ET 容易出错：</strong>它只通知状态变化的边沿，漏读一次就永久丢事件。LT 每次 <code>epoll_wait</code> 都会提醒，容错性高，所以新服务优先 LT。</p>
+        <p><strong>追问：</strong>accept 在 ET 下要注意什么？—— 也要循环 accept 直到 <code>EAGAIN</code>，否则并发连接会漏掉。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>为什么 epoll 比 select 快？</summary>
+      <div class="a">
+        <p>两点，不是「红黑树」：</p>
+        <ol>
+          <li><strong>注册一次，不再重复拷贝和扫描。</strong>select 每次调用都要把 fd 集合拷进内核并遍历 O(n)；epoll 在 <code>epoll_ctl</code> 时完成注册。</li>
+          <li><strong>就绪事件由回调挂链表。</strong>数据到达时驱动回调把 epitem 挂到 <code>rdllist</code>，<code>epoll_wait</code> 只返回就绪的 O(k)。</li>
+        </ol>
+        <p>红黑树只是 fd → epitem 的索引，支持 O(log n) 增删查，换成哈希表也一样快。</p>
+        <p><strong>追问：</strong>什么时候 select 更合适？—— 连接数很少且都活跃时，epoll 的额外系统调用和数据结构开销不占优；而且 select 可移植性好（跨平台）。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>一次收包的完整路径？</summary>
+      <div class="a">
+        <p>网卡 DMA 写 RX ring → 硬中断只做 <code>napi_schedule()</code> → 软中断 <code>NET_RX_SOFTIRQ</code> 里 NAPI poll（weight 64，总预算 300 包 / 2 ms）→ <code>netif_receive_skb</code> → <code>ip_rcv</code> → <code>tcp_v4_rcv</code> → 四元组哈希找 socket → 挂 <code>sk_receive_queue</code> → <code>sk_data_ready</code> 唤醒进程 → <code>copy_to_user</code>。</p>
+        <p><strong>三个易混队列：</strong>RX ring（网卡）、backlog（per-CPU 软中断）、socket 接收队列（每连接）。</p>
+        <p><strong>为什么 NAPI 是混合模式：</strong>低负载用中断保证延迟，高负载关中断批量轮询避免中断风暴。</p>
+        <p><strong>追问：</strong>多核并行靠什么？—— 网卡多队列 RSS + IRQ affinity；单队列网卡只能一个 CPU 收包。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>sendfile 为什么快？拷了几次？</summary>
+      <div class="a">
+        <p><code>read</code>+<code>write</code>：4 次拷贝（2 次 DMA + 2 次 CPU）、4 次上下文切换。</p>
+        <p><code>sendfile</code>：3 次拷贝、2 次切换。数据在内核内部从 page cache 直接进 socket buffer，不经过用户态。若网卡支持 SG-DMA，内核把页直接交给网卡，降到 2 次拷贝。</p>
+        <p>省掉的是「内核 → 用户」的 CPU 拷贝和两次切换。</p>
+        <p><strong>追问：</strong>零拷贝真的零吗？—— 不是，DMA 拷贝仍在，只是不占 CPU。零拷贝省的是 CPU 拷贝和上下文切换。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>RDMA 为什么比 TCP 快？</summary>
+      <div class="a">
+        <p>① Kernel bypass：用户态直接写网卡 doorbell，无系统调用。② Zero-copy：注册内存与网卡之间直接 DMA。③ 无 CPU 参与：可靠性卸载到网卡，完成事件写 CQ，用户态轮询，无中断。</p>
+        <p>代数是：专用网卡、无损网络（RoCE 需 PFC/ECN）、MR 要 pin 页、编程模型复杂。</p>
+        <p><strong>追问：</strong>GPUDirect 又是什么？—— 网卡直接 DMA 读写显存，绕过 CPU 和主存，跨机 NCCL 的关键。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>NCCL 的 Ring AllReduce 带宽怎么算？</summary>
+      <div class="a">
+        <p>Reduce-Scatter + All-Gather，各 N−1 步，每步传 S/N。</p>
+        <p>每 GPU 总传输量 = <code>2(N−1)/N × S</code>；<code>algbw = S/t</code>；<code>busbw = algbw × 2(N−1)/N</code>。</p>
+        <p>判断网络是否跑满，看 <strong>busbw 是否接近物理带宽</strong>。8 卡、100 GB/s、1 GB 数据，理论最短 ≈ 17.5 ms。</p>
+        <p><strong>追问：</strong>为什么大消息用 Ring、小消息用 Tree？—— Ring 带宽最优但 2(N−1) 步；Tree 是 O(log N) 步，小消息下延迟由步数主导。</p>
+      </div>
+    </details>
+
+    <div class="box ok" style="margin-top:34px">
+      <span class="box-title">下一步</span>
+      去 <a href="../quiz/index.html?cat=net">刷网络专题</a>。然后读 <a href="cpp.html">C / C++</a>。
+    </div>
+  </main>
+</div>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

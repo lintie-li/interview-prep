@@ -1,0 +1,218 @@
+{
+  "questions": [
+    {
+      "id": "g-001",
+      "q": "NVIDIA GPU 上一个 warp 包含多少个线程？",
+      "opts": ["16", "32", "64", "128"],
+      "a": 1,
+      "exp": "从 Fermi 到 Blackwell 一直是 32 个线程为一个 warp，这是 SIMT 调度的基本单位。一个 SM 同时驻留多个 warp（上限由每 SM 的 warp slot 决定），调度器在每个周期从就绪 warp 中挑一个发射指令，以此隐藏访存与流水线延迟。",
+      "level": "高频",
+      "tags": ["SM", "SIMT"]
+    },
+    {
+      "id": "g-002",
+      "q": "一个 thread block 最多可以有多少个线程？",
+      "opts": ["512", "1024", "2048", "取决于 SM"],
+      "a": 1,
+      "exp": "1024 是 CUDA 的硬上限，且必须是 warp(32) 的整数倍才不浪费。但能不能同时驻留取决于资源：寄存器、共享内存、每 SM 的 block 数量上限。所以「block 开 1024」在实践中常因寄存器压力导致 occupancy 下降。",
+      "level": "高频",
+      "tags": ["线程模型"]
+    },
+    {
+      "id": "g-003",
+      "q": "CUDA Runtime API 与 Driver API 的关系是？",
+      "opts": [
+        "两者完全独立，互不影响",
+        "Runtime API（cudaXxx）构建在 Driver API（cuXxx）之上，前者负责上下文等样板管理，后者暴露更细粒度的控制",
+        "Driver API 是旧接口，已废弃",
+        "Runtime API 只能用于多 GPU，Driver API 只能用于单 GPU"
+      ],
+      "a": 1,
+      "exp": "libcudart 内部调用 libcuda。Runtime 帮你隐式创建 primary context、管理模块加载；Driver 则要你显式 cuInit/cuCtxCreate/cuModuleLoad，换来对上下文、模块、内存对象的精确控制。写驱动/框架层基本都用 Driver API。",
+      "level": "高频",
+      "tags": ["CUDA", "API 分层"]
+    },
+    {
+      "id": "g-004",
+      "q": "CUDA 中「上下文（context）」和「流（stream）」的关系是？",
+      "opts": [
+        "一个流可以跨多个上下文",
+        "上下文是资源容器（地址空间、模块、分配器状态），流是上下文内的有序任务队列；同一流内串行，不同流之间可并发",
+        "两者是同一个东西的不同叫法",
+        "上下文是线程级的，流是进程级的"
+      ],
+      "a": 1,
+      "exp": "context 相当于 GPU 侧的「进程地址空间」，所有显存分配、模块、句柄都归属于它。stream 是 context 内的执行队列，用来表达依赖顺序。跨 stream 没有顺序保证，需要 event 或显式同步。context 的创建/销毁很贵，多线程应共享而不是各建一个。",
+      "level": "高频",
+      "tags": ["CUDA", "上下文", "流"]
+    },
+    {
+      "id": "g-005",
+      "q": "cudaMemcpyAsync 从主机内存拷贝到显存，要真正异步必须满足什么条件？",
+      "opts": [
+        "主机内存必须是页锁定（pinned / cudaMallocHost）的",
+        "必须使用默认流",
+        "必须开启 Unified Memory",
+        "目标必须是共享内存"
+      ],
+      "a": 0,
+      "exp": "普通 pageable 内存下，驱动必须先把它搬进内部暂存缓冲，这个动作对调用线程是同步的，函数返回时数据已拷完。只有 pinned 内存才能靠 DMA 引擎在后台搬、把控制权立刻还给 CPU。代价是 pinned 内存不可换出，不能滥用。",
+      "level": "高频",
+      "tags": ["CUDA", "内存", "DMA"]
+    },
+    {
+      "id": "g-006",
+      "q": "关于 Unified Memory（cudaMallocManaged），正确的是？",
+      "opts": [
+        "数据只能被 GPU 访问",
+        "CPU 和 GPU 共用同一套虚拟地址，物理页按需在两侧迁移，迁移由页错误驱动（或预取）",
+        "它就是 pinned 内存的别名",
+        "它不需要同步"
+      ],
+      "a": 1,
+      "exp": "cudaMallocManaged 返回的指针在 host 和 device 上都能解引用，驱动维护单一虚拟地址、物理页可落在任一侧。首次访问时若页不在本地会触发 GPU/CPU 页错误并迁移，所以「第一次跑慢、后续快」。在 Blackwell/Hopper 这类带 CPU-GPU 一致性互联的平台上语义更强，但一般 PCIe 平台上仍要小心 thrashing。",
+      "level": "高频",
+      "tags": ["CUDA", "统一内存", "HMM"]
+    },
+    {
+      "id": "g-007",
+      "q": "warp divergence（分支发散）为什么影响性能？",
+      "opts": [
+        "因为会触发重编译",
+        "因为一个 warp 共用一条指令流，分支两侧必须串行执行，且只有部分 lane 有效，无法合并访存",
+        "因为它强制回退到 CPU 执行",
+        "因为会耗尽共享内存"
+      ],
+      "a": 1,
+      "exp": "SIMT 下一个 warp 的所有 lane 共享 PC，遇到分支就按路径序列化执行、用 mask 屏蔽不参与的 lane，总时间约为各分支时间之和。如果两侧访存地址不能合并，还会放大内存事务数。Volta 之后的独立线程调度缓解了死锁风险，但不消除发散本身的性能代价。",
+      "level": "高频",
+      "tags": ["SIMT", "性能"]
+    },
+    {
+      "id": "g-008",
+      "q": "为了隐藏全局内存访问延迟，最有效的手段是？",
+      "opts": [
+        "提高单线程的 ILP",
+        "提高 occupancy，让 SM 有足够多的 resident warp 可切换",
+        "加大每个 block 的线程数到 1024",
+        "把数据放进 local memory"
+      ],
+      "a": 1,
+      "exp": "GPU 靠「多 warp 轮转」而不是深度乱序来隐藏延迟。全局访存要几百个 cycle，必须有足够多就绪 warp 填满流水线。但 occupancy 不是越高越好：提高它会挤占寄存器与共享内存，可能反而降低每线程性能。正确做法是用 Nsight Compute 看 stall 原因再调。",
+      "level": "高频",
+      "tags": ["性能", "occupancy"]
+    },
+    {
+      "id": "g-009",
+      "q": "显存带宽与容量之间的关系，下列描述正确的是？",
+      "opts": [
+        "HBM 的带宽显著高于 GDDR，靠的是更多、更宽的堆叠通道和更高的总位宽",
+        "HBM 带宽高是因为频率远高于 GDDR",
+        "显存带宽与 GPU 计算能力无关",
+        "增加显存容量必然提升带宽"
+      ],
+      "a": 0,
+      "exp": "HBM 用 2.5D 封装把多层 DRAM 堆栈和 GPU 封在一起，通过硅中介层走超宽位宽（HBM2e/HBM3 每堆栈 1024 bit），靠位宽而非超高频率拿到带宽。以 A100 80GB 为例 HBM2e 带宽为 2039 GB/s，H100 SXM 的 HBM3 为 3.35 TB/s。带宽决定「访存受限」算子的上限。",
+      "level": "中频",
+      "tags": ["HBM", "显存"]
+    },
+    {
+      "id": "g-010",
+      "q": "GPU 用户态驱动（UMD）与内核态驱动（KMD）的分工，最准确的描述是？",
+      "opts": [
+        "UMD 做全部硬件操作，KMD 只负责加载",
+        "KMD 负责资源与权限管理（显存分配、通道/上下文创建、中断、电源、GPU 页表），UMD 负责把 API 调用翻译成硬件命令并直接提交到 GPU 队列",
+        "UMD 跑在内核里，KMD 跑在用户态",
+        "所有命令都必须经 ioctl 由 KMD 提交"
+      ],
+      "a": 1,
+      "exp": "现代 GPU 驱动的关键设计是「内核控制、用户态提交」：KMD 建立并授权一个 channel/context 与对应的 GPU 页表，然后 UMD 就能把命令写进映射到用户空间的 pushbuffer，敲 doorbell 让硬件取。内核不在提交热路径上，这是低延迟和高吞吐的前提。AMD amdgpu 的 ring、NVIDIA 的 channel/GPFIFO 都是这个模型。",
+      "level": "高频",
+      "tags": ["驱动", "UMD", "KMD"]
+    },
+    {
+      "id": "g-011",
+      "q": "GPU 命令提交中的「doorbell」机制，本质是什么？",
+      "opts": [
+        "一种中断，由 GPU 发给 CPU",
+        "UMD 往一个映射到用户空间的 MMIO 寄存器写入新的队尾指针，硬件据此知道有新命令可取",
+        "一种 DMA 描述符格式",
+        "一个内核系统调用"
+      ],
+      "a": 1,
+      "exp": "doorbell 是一个 BAR 里的寄存器（每通道一个）。UMD 填好 pushbuffer、更新内存中的 write pointer，再写 doorbell 通知硬件。因为寄存器被映射进用户态，这一步不需要 ioctl。硬件收到后 DMA 读取命令。与之相对的 work pointer 由硬件回写，用户态轮询即可知道完成进度。",
+      "level": "中频",
+      "tags": ["驱动", "命令提交"]
+    },
+    {
+      "id": "g-012",
+      "q": "CUDA Graph 主要解决什么问题？",
+      "opts": [
+        "降低 GPU 显存占用",
+        "把一串重复的 kernel/拷贝调用「录制」成图，一次提交重复回放，消除逐次 launch 的 CPU 开销",
+        "让 kernel 跑得更快",
+        "实现跨 GPU 通信"
+      ],
+      "a": 1,
+      "exp": "小 kernel 的 launch 开销在 CPU 侧有数微秒量级，当 kernel 本身只有几微秒时，CPU 成为瓶颈（launch-bound）。Graph 把依赖关系一次性捕获、整体提交，把 N 次提交压成 1 次，还顺带让驱动做更激进的重叠与优化。注意它优化的是提交开销，不改变 kernel 内部性能。",
+      "level": "中频",
+      "tags": ["CUDA", "Graphs"]
+    },
+    {
+      "id": "g-013",
+      "q": "MPS 与 MIG 的区别，正确的是？",
+      "opts": [
+        "MPS 是硬件分区，MIG 是软件共享",
+        "MIG 把 GPU 切分成物理隔离的若干实例（各自有独立 SM 切片、显存、缓存），MPS 让多个进程共享同一 GPU/context 空间以降低调度开销，但故障与资源并不强隔离",
+        "两者都是虚拟化方案，等价",
+        "MPS 只能用于 A100 以后"
+      ],
+      "a": 1,
+      "exp": "MIG 是硬件级切分（A100/H100 支持，最多 7 个 slice），有独立的显存与 fault domain，适合多租户；MPS 是运行时的多进程服务，多个 client 共享一个 context，省掉 context switch 并让 kernel 并发填充空闲 SM，但一个进程 OOM 或 CUDA 错误可能拖累其他 client。",
+      "level": "中频",
+      "tags": ["MPS", "MIG", "多租户"]
+    },
+    {
+      "id": "g-014",
+      "q": "GPU 与 CPU 之间的 PCIe 传输，下列数字层次最接近实际的是？",
+      "opts": [
+        "PCIe Gen4 x16 双向约 64 GB/s（每方向约 32 GB/s）",
+        "PCIe Gen4 x16 双向约 6.4 GB/s",
+        "PCIe Gen5 x16 每方向约 256 GB/s",
+        "PCIe 带宽与代际无关"
+      ],
+      "a": 0,
+      "exp": "Gen4 x16 理论 ~32 GB/s 每方向，实际可达 ~25 GB/s。Gen5 x16 翻倍到 ~64 GB/s 每方向。这比 HBM 的 TB/s 量级低两个数量级，所以「减少 host-device 传输」永远是最优先的优化，NVLink（H100 达 900 GB/s 双向）就是为了绕开这个瓶颈。",
+      "level": "中频",
+      "tags": ["PCIe", "互联"]
+    },
+    {
+      "id": "g-015",
+      "q": "CUDA 的内存模型中，为什么需要 __syncthreads() 而不能依赖 volatile？",
+      "opts": [
+        "两者等价，习惯问题",
+        "__syncthreads 是 block 内屏障，既保证同步点、又提供内存序；volatile 只阻止编译器优化单个变量访问，不建立跨线程顺序，也不保证共享内存可见性",
+        "volatile 只能用于全局内存",
+        "__syncthreads 只能用于 warp 内"
+      ],
+      "a": 1,
+      "exp": "CUDA 是弱内存模型。共享内存的写入对其他线程可见需要屏障来建立 happens-before。volatile 只让编译器每次都去内存读，不产生 barrier 语义，也不保证编译器不重排其他访存。warp 内做数据交换应优先用 __shfl_sync 系列，比共享内存加屏障更轻。",
+      "level": "中频",
+      "tags": ["CUDA", "内存模型", "同步"]
+    },
+    {
+      "id": "g-016",
+      "q": "同一个 stream 内先后 launch 的 kernel，其执行顺序保证是？",
+      "opts": [
+        "并行执行，无顺序",
+        "严格按提交顺序执行，后一个不会早于前一个开始",
+        "由硬件随机调度",
+        "只有加了 event 才有顺序"
+      ],
+      "a": 1,
+      "exp": "stream 的定义就是有序队列，同流内串行。不同 stream 之间默认无顺序、可并发（受 SM 资源限制）。要在两个 stream 之间建立依赖，用 cudaEventRecord + cudaStreamWaitEvent。这也是「多流重叠拷贝与计算」的基础。",
+      "level": "高频",
+      "tags": ["CUDA", "流"]
+    }
+  ]
+}

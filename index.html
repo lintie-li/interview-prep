@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPU / 内核方向面试准备</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="home">
+<div id="topbar" data-base=""></div>
+<div style="height:3px;background:transparent"><i id="read-bar" style="display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--purple))"></i></div>
+
+<div class="wrap">
+  <section class="hero">
+    <h1>面向 <span class="grad">GPU 驱动 / 内核</span> 方向的<br>系统性面试准备</h1>
+    <p class="lead">
+      依据 NVIDIA、AMD、Qualcomm 真实岗位 JD 反向整理的知识体系。
+      覆盖 Linux 内核与驱动、GPU 软件栈与 CUDA、虚拟化、计算机网络、C/C++ 系统编程。
+      每个专题配「知识阅读」与「分类刷题」两条线。
+    </p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="quiz/index.html">开始刷题 →</a>
+      <a class="btn btn-ghost" href="pages/roadmap.html">看岗位要求与路线</a>
+    </div>
+
+    <div class="stat-row">
+      <div class="stat"><b>7</b><span>知识专题</span></div>
+      <div class="stat"><b id="stat-q">—</b><span>选择题</span></div>
+      <div class="stat"><b>4</b><span>目标公司方向</span></div>
+      <div class="stat"><b>5+</b><span>年社招深度</span></div>
+    </div>
+  </section>
+
+  <div class="box" style="margin-top:34px">
+    <span class="box-title">本页的定位</span>
+    本材料面向 GPU / AI 基础设施方向的资深岗，尤其是驱动、运行时与内核这一侧。
+    因此这份材料<strong>不覆盖算子开发（kernel writing / 算子优化）</strong>，
+    重点放在<strong>驱动、运行时、内核、虚拟化、系统性能</strong>这些"以软件驾驭硬件"的部分。
+    基础（C/C++、网络、OS）按资深岗深度准备，而不是校招深度。
+  </div>
+
+  <div class="sec-head"><h2>知识专题</h2><a href="pages/roadmap.html">岗位要求 →</a></div>
+  <div class="grid grid-3">
+    <a class="card" href="pages/kernel.html">
+      <span class="card-emoji">🧩</span>
+      <h3>Linux 内核与驱动</h3>
+      <p>进程调度、内存管理、中断与并发、设备模型、字符/块/网络驱动、DMA、mmap。</p>
+      <div class="meta"><span class="tag blue">高频</span><span>内核态</span></div>
+    </a>
+    <a class="card" href="pages/gpu.html">
+      <span class="card-emoji">⚡</span>
+      <h3>GPU 软件栈与 CUDA</h3>
+      <p>UMD/KMD 分层、CUDA 上下文与流、内存模型与统一内存、内核调度、同步。</p>
+      <div class="meta"><span class="tag purple">重点</span><span>NVIDIA</span></div>
+    </a>
+    <a class="card" href="pages/virt.html">
+      <span class="card-emoji">🧊</span>
+      <h3>虚拟化与隔离</h3>
+      <p>KVM/QEMU、VFIO、SR-IOV、IOMMU、vGPU、GPU 直通与容器化 GPU。</p>
+      <div class="meta"><span class="tag amber">加分</span><span>云原生</span></div>
+    </a>
+    <a class="card" href="pages/net.html">
+      <span class="card-emoji">🌐</span>
+      <h3>计算机网络</h3>
+      <p>TCP/IP 协议栈、拥塞控制、零拷贝、epoll、RDMA、分布式训练通信。</p>
+      <div class="meta"><span class="tag blue">高频</span><span>系统</span></div>
+    </a>
+    <a class="card" href="pages/cpp.html">
+      <span class="card-emoji">🔧</span>
+      <h3>C / C++ 系统编程</h3>
+      <p>对象模型、内存序、RAII、多线程、ABI、链接、未定义行为、性能陷阱。</p>
+      <div class="meta"><span class="tag green">必考</span><span>基础</span></div>
+    </a>
+    <a class="card" href="pages/python.html">
+      <span class="card-emoji">🐍</span>
+      <h3>Python</h3>
+      <p>GIL、对象模型、生成器与协程、异步、内存管理、作为胶水层的工程实践。</p>
+      <div class="meta"><span class="tag amber">辅助</span><span>工具链</span></div>
+    </a>
+    <a class="card" href="pages/sysdebug.html">
+      <span class="card-emoji">🔬</span>
+      <h3>调试与性能分析</h3>
+      <p>GDB、crash/dmesg、ftrace/perf/eBPF、内存泄漏、死锁、火焰图方法论。</p>
+      <div class="meta"><span class="tag red">实战场</span><span>排障</span></div>
+    </a>
+    <a class="card" href="quiz/index.html">
+      <span class="card-emoji">🎯</span>
+      <h3>分类刷题</h3>
+      <p>按专题分类的选择题，即时判分、附解析、记录错题与掌握度。</p>
+      <div class="meta"><span class="tag green">刷题</span><span>自测</span></div>
+    </a>
+  </div>
+
+  <div class="box ok" style="margin-top:26px">
+    <span class="box-title">离线可用</span>
+    整个目录不依赖任何服务器、CDN 或构建工具。把 <code>interview-prep</code> 文件夹整体拷走，
+    双击 <code>index.html</code> 用 <code>file://</code> 打开即可 —— 阅读、刷题、错题本、主题切换全部照常工作。
+    题目数据已打包进 <code>quiz/data/bundle.js</code>，不经过 <code>fetch</code>，因此不受同源策略限制。
+  </div>
+
+  <div class="sec-head"><h2>怎么用</h2></div>
+  <div class="grid grid-2">
+    <div class="card" style="cursor:default">
+      <h3>1 · 先定位自己</h3>
+      <p>读 <a href="pages/roadmap.html">岗位与路线</a>，把 JD 里的高频要求对照自己的经验打勾，
+      找出「必须补」和「可以放过」的差异项。资深岗更看系统深度而非背题量。</p>
+    </div>
+    <div class="card" style="cursor:default">
+      <h3>2 · 按专题读</h3>
+      <p>每页末尾都整理成可展开的问答（Q&A），读的时候可以自问自答。
+      阅读页解决"讲得清楚"，刷题页解决"记得住、答得准"。</p>
+    </div>
+    <div class="card" style="cursor:default">
+      <h3>3 · 限时刷题</h3>
+      <p>刷题页按专题分卷，答完即可看到解析与正确率。
+      错题会自动记录，可以反复刷错题卷。</p>
+    </div>
+    <div class="card" style="cursor:default">
+      <h3>4 · 复盘弱项</h3>
+      <p>面试前一周只刷错题和 <span class="tag red">高频</span> 标签的题；
+      把 Q&A 用自己的话讲一遍，讲不顺的就是没掌握。</p>
+    </div>
+  </div>
+
+  <div class="box warn" style="margin-top:44px">
+    <span class="box-title">关于内容可靠性</span>
+    岗位要求部分引用的是 NVIDIA 官方 Workday 招聘系统的真实 JD 原文（2026 年抓取），
+    技术知识部分是按业界通用面试口径整理的系统性材料。具体到某家公司某一轮面试，
+    题目会随团队差异很大 —— 这份材料的价值在于<strong>覆盖面和系统深度</strong>，而不是押题。
+  </div>
+</div>
+
+<script src="assets/app.js"></script>
+<script src="quiz/data/bundle.js"></script>
+<script>
+// 填首页题目数。题库已由 bundle.js 打包成 window.__QUIZ_DATA__，
+// 所以离线双击打开也能正确显示（fetch 在 file:// 下会被同源策略拦）。
+(function () {
+  var el = document.getElementById('stat-q');
+  if (!el) return;
+  var d = window.__QUIZ_DATA__;
+  if (d && d.categories) {
+    el.textContent = d.categories.reduce(function (a, c) { return a + c.count; }, 0);
+    return;
+  }
+  fetch('quiz/data/index.json').then(function (r) { return r.json(); }).then(function (idx) {
+    el.textContent = idx.categories.reduce(function (a, c) { return a + c.count; }, 0);
+  }).catch(function () {});
+})();
+</script>
+</body>
+</html>

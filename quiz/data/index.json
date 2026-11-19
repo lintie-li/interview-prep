@@ -1,0 +1,53 @@
+{
+  "categories": [
+    {
+      "key": "kernel",
+      "name": "Linux 内核",
+      "file": "kernel.json",
+      "count": 16,
+      "desc": "进程/内存/并发/中断/驱动模型。答不全数字，等于没做过内核。"
+    },
+    {
+      "key": "gpu",
+      "name": "GPU / CUDA",
+      "file": "gpu.json",
+      "count": 16,
+      "desc": "UMD/KMD 分层、显存、命令提交、同步、MPS/MIG。NVIDIA 方向的核心。"
+    },
+    {
+      "key": "virt",
+      "name": "虚拟化",
+      "file": "virt.json",
+      "count": 12,
+      "desc": "KVM/QEMU、VT-x/EPT、VFIO/SR-IOV、virtio、GPU 虚拟化。"
+    },
+    {
+      "key": "net",
+      "name": "计算机网络",
+      "file": "net.json",
+      "count": 12,
+      "desc": "TCP 状态机、epoll、零拷贝、RDMA、收包路径。"
+    },
+    {
+      "key": "cpp",
+      "name": "C / C++",
+      "file": "cpp.json",
+      "count": 16,
+      "desc": "对象模型、内存序、RAII、移动语义、UB。基本盘，权重最高。"
+    },
+    {
+      "key": "python",
+      "name": "Python",
+      "file": "python.json",
+      "count": 12,
+      "desc": "GIL、对象模型、生成器、C 扩展。工具链与脚本层。"
+    },
+    {
+      "key": "sysdebug",
+      "name": "调试与性能",
+      "file": "sysdebug.json",
+      "count": 12,
+      "desc": "perf、ftrace、eBPF、lockdep、kdump。面试里最能区分真做过和只知道的人。"
+    }
+  ]
+}

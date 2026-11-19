@@ -1,0 +1,172 @@
+{
+  "questions": [
+    {
+      "id": "v-001",
+      "q": "Intel VT-x 中 VMCS（Virtual Machine Control Structure）的作用是？",
+      "opts": [
+        "保存虚拟机的磁盘镜像",
+        "每 vCPU 一份的控制结构，保存 guest/host 状态区、VM-exit/VM-entry 控制字段与 exit 原因",
+        "CPU 与 GPU 之间的通信缓冲区",
+        "EPT 页表的备份"
+      ],
+      "a": 1,
+      "exp": "VMCS 由 VMPTRLD 装载，物理上每 vCPU 一个。它记录 guest 的寄存器状态、host 的恢复状态、哪些指令/事件触发 VM-exit，以及退出原因（exit qualification）。VMREAD/VMWRITE 访问。VMX 的 root（host）与 non-root（guest）两种操作模式之间靠 VMLAUNCH/VMRESUME 与 VM-exit 切换。",
+      "level": "高频",
+      "tags": ["VT-x", "CPU 虚拟化"]
+    },
+    {
+      "id": "v-002",
+      "q": "EPT（Extended Page Tables）解决的核心问题是？",
+      "opts": [
+        "让 guest 物理地址无需软件介入即可二次翻译到 host 物理地址，消除传统影子页表的 VM-exit 开销",
+        "加密 guest 内存",
+        "减少 TLB 容量需求",
+        "让 DMA 绕过 IOMMU"
+      ],
+      "a": 0,
+      "exp": "没有 EPT 时，guest 页表里的 GPA 需要在 host 侧维护影子页表（shadow page table），每次 guest 改页表都要 VM-exit 去同步，代价极高。EPT 让硬件做 GPA→HPA 的第二层翻译，guest 可以完全拥有自己的页表。AMD 的对应技术叫 NPT。代价是 EPT violation 的处理，以及 TLB 需要两级遍历。",
+      "level": "高频",
+      "tags": ["EPT", "内存虚拟化"]
+    },
+    {
+      "id": "v-003",
+      "q": "KVM 与 QEMU 的分工，下列描述最准确的是？",
+      "opts": [
+        "QEMU 是内核模块，KVM 是用户态进程",
+        "KVM 是内核模块，提供 /dev/kvm 与 vCPU 执行、内存映射、中断注入等原语；QEMU 是用户态 VMM，负责设备模拟、磁盘镜像、生命周期与命令行",
+        "两者功能重叠，可任选其一",
+        "KVM 负责设备模拟，QEMU 负责 vCPU 调度"
+      ],
+      "a": 1,
+      "exp": "KVM 本身不做设备模拟，它把 CPU 虚拟化能力（VT-x/SVM）包装成 ioctl：创建 VM、创建 vCPU、KVM_RUN 进入 guest。QEMU 用这些 ioctl 跑 vCPU 线程，并在 host 侧模拟网卡、磁盘、芯片组。性能敏感的设备走 virtio，更极致的走 VFIO 直通。KVM 是 hypervisor，QEMU 是 VMM。",
+      "level": "高频",
+      "tags": ["KVM", "QEMU"]
+    },
+    {
+      "id": "v-004",
+      "q": "virtio 的 split virtqueue 由三部分组成，它们是？",
+      "opts": [
+        "descriptor table、available ring、used ring",
+        "producer、consumer、broker",
+        "RX queue、TX queue、control queue",
+        "header、payload、checksum"
+      ],
+      "a": 0,
+      "exp": "descriptor table 描述 buffer 的地址/长度/next 链；avail ring 是驱动告诉设备「哪些描述符可用了」；used ring 是设备回写「哪些已处理完」。两环用 idx 单调递增，用位宽掩码取模，天然无锁（单生产者单消费者）。这种「共享内存 + 通知」的模型避免了每次 IO 的 trap。",
+      "level": "高频",
+      "tags": ["virtio", "IO 虚拟化"]
+    },
+    {
+      "id": "v-005",
+      "q": "VFIO 直通（device passthrough）依赖的关键硬件能力是？",
+      "opts": [
+        "EPT",
+        "IOMMU（Intel VT-d / AMD-Vi），把设备发起的 DMA 地址翻译并隔离到该 VM 的地址空间",
+        "SR-IOV",
+        "NUMA"
+      ],
+      "a": 1,
+      "exp": "直通给 VM 后，设备 DMA 直接读写内存。没有 IOMMU，设备就能 DMA 到任意物理地址，VM 可以借此破坏 host。IOMMU 给设备一张独立的翻译表，把 GPA 限定在该 VM 的范围内，同时拦住非法访问（DMAR fault）。VFIO 在用户态封装了这套机制，配合 VF 中断重映射。SR-IOV 常与 VFIO 一起用，但不是必需品。",
+      "level": "高频",
+      "tags": ["VFIO", "IOMMU"]
+    },
+    {
+      "id": "v-006",
+      "q": "SR-IOV 中 PF（Physical Function）与 VF（Virtual Function）的关系是？",
+      "opts": [
+        "PF 是虚拟设备，VF 是物理设备",
+        "PF 是具备完整配置能力的物理功能（可创建/管理 VF），VF 是轻量级的虚拟功能，可直接分配给 VM 使用",
+        "一个 VF 可对应多个 PF",
+        "两者必须同时分配给同一个 VM"
+      ],
+      "a": 1,
+      "exp": "PF 负责链路与 SR-IOV capability 的管理，通过创建 VF（sriov_numvfs）把硬件切成多个轻量实例。每个 VF 有自己的 PCI 配置空间、BAR、以及独立的队列资源，但共享同一物理端口。VF 直通给 VM 后可以接近裸机性能，代价是失去了 host 侧的软件交换与迁移能力。",
+      "level": "中频",
+      "tags": ["SR-IOV", "IO 虚拟化"]
+    },
+    {
+      "id": "v-007",
+      "q": "下列哪种情况会触发 VM-exit？",
+      "opts": [
+        "guest 执行普通的内存读写",
+        "guest 执行 CPUID 或访问未配置为直通的 MSR，以及发生 EPT violation",
+        "guest 内的用户态进程做系统调用",
+        "guest 读取自己的页表"
+      ],
+      "a": 1,
+      "exp": "VM-exit 由 VMCS 的 execution controls 定义：CPUID、RDMSR/WRMSR（未 bitmap 允许的）、HLT、IO 指令、CR 访问、以及 EPT violation、外部中断（视配置）等。普通内存访问与 guest 内部 syscall 都不会退出——这正是硬件辅助虚拟化高效的原因。VM-exit 是昂贵的，主流优化都围绕削减它的次数。",
+      "level": "高频",
+      "tags": ["VT-x", "VM-exit"]
+    },
+    {
+      "id": "v-008",
+      "q": "GPU 虚拟化的几种技术路线中，「API remoting」的特点是？",
+      "opts": [
+        "把整块 GPU 通过 VFIO 直通给一个 VM",
+        "在 guest 内拦截图形/CUDA API 调用，序列化后交给 host 或远端执行，guest 里没有真实驱动栈",
+        "通过 SR-IOV 切分 SM",
+        "用 MIG 做硬件分区"
+      ],
+      "a": 1,
+      "exp": "典型代表是 NVIDIA vGPU 的部分模式、以及各类远程渲染方案。好处是 VM 可迁移、可超分；坏处是 API 调用需要跨 VM 边界序列化与转发，上下文切换开销大，且必须针对每套 API 做适配。相比之下 passthrough 性能最好但不支持迁移，SR-IOV/MIG 介于两者之间。",
+      "level": "中频",
+      "tags": ["GPU 虚拟化"]
+    },
+    {
+      "id": "v-009",
+      "q": "内存气球（ballooning）在虚拟化中的作用是？",
+      "opts": [
+        "加速内存访问",
+        "让 hypervisor 通过 guest 内的气球驱动回收其未使用的物理页，实现内存超分下的动态调整",
+        "做内存快照",
+        "实现内存加密"
+      ],
+      "a": 1,
+      "exp": "host 内存紧张时，virtio-balloon 驱动在 guest 内 inflate：申请并「钉住」一批页，把 PFN 报告给 host，host 即可回收这些物理页给别人用。deflate 则归还。它需要 guest 配合，且在 guest 内存压力大时效果有限。这与 KSM 的页合并是两条不同的路线。",
+      "level": "中频",
+      "tags": ["内存虚拟化", "balloon"]
+    },
+    {
+      "id": "v-010",
+      "q": "vCPU 的 steal time（偷取时间）指的是？",
+      "opts": [
+        "guest 自己空闲的时间",
+        "vCPU 处于可运行状态、但被 host 调度器调度出去未能真正占用物理 CPU 的时间",
+        "中断处理占用的时间",
+        "guest 内核态执行时间"
+      ],
+      "a": 1,
+      "exp": "由 KVM 通过 pvclock 的 steal_time 字段暴露给 guest（体现在 /proc/stat 的 steal 列）。steal 高说明物理 CPU 争抢严重或 vCPU 被超额分配。虚拟机里观察到的「CPU 很闲但程序很慢」常常就是这个原因。解决办法是减少 vCPU 超分、绑定 CPU、隔离中断。",
+      "level": "中频",
+      "tags": ["vCPU", "性能"]
+    },
+    {
+      "id": "v-011",
+      "q": "嵌套虚拟化（nested virtualization）的性能开销主要来自？",
+      "opts": [
+        "guest 内存更大",
+        "L1 hypervisor 自身运行在 L0 的 guest 中，L2 的 VM-exit 需要先陷入 L0 再由 L1 软件模拟，形成双层退出",
+        "磁盘 IO 变慢",
+        "CPU 频率降低"
+      ],
+      "a": 1,
+      "exp": "硬件（VMCS shadowing、ARM 的 VHE 等）能减轻但不能消除。L2 guest 的一次敏感操作会 exit 到 L1，若 L1 无法在本地处理，还要再 exit 到 L0，两者之间靠软件模拟 VMCS 的读写。所以嵌套层数越多、开销越非线性增长。EPT 也因此变成两级嵌套翻译。",
+      "level": "低频",
+      "tags": ["嵌套虚拟化"]
+    },
+    {
+      "id": "v-012",
+      "q": "virtio 中「通知抑制 / 中断合并」主要用于优化什么？",
+      "opts": [
+        "减少内存占用",
+        "减少 doorbell 与中断的次数，避免每处理一个包就陷入一次，从而降低 CPU 开销",
+        "提高网络带宽上限",
+        "实现设备热插拔"
+      ],
+      "a": 1,
+      "exp": "virtqueue 有 EVENT_IDX 等特性，可以让一端声明「攒够 N 个再通知我」，或临时关闭通知。内核的 NAPI 与 virtio 的 tx/rx 中断合并配合，把「每包一中断」变成批量处理。代价是延迟上升，所以低延迟场景（如 DPDK、vhost-user 的 busy polling）会反过来选择关闭中断、改用轮询。",
+      "level": "中频",
+      "tags": ["virtio", "性能"]
+    }
+  ]
+}

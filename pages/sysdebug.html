@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>调试与性能分析 · 面试准备</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="sysdebug">
+<div id="topbar" data-base="../"></div>
+<div style="position:sticky;top:56px;z-index:49;height:3px;background:transparent"><i id="read-bar" style="display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--purple))"></i></div>
+
+<div class="wrap">
+<div class="layout">
+  <aside class="sidebar"><div id="toc"></div></aside>
+
+  <main class="content">
+    <h1>调试与性能分析</h1>
+    <p style="color:var(--text-dim);font-size:15.5px">
+      NVIDIA 虚拟化的 JD 明确写了 <strong>GDB / KGDB / ftrace / perf</strong> 定位复杂内核问题。
+      但面试官不考你背参数 —— 考的是<strong>拿到一个从没见过的现场，你怎么一步步缩小范围</strong>。
+      这一页只保留「能讲出判断逻辑」的部分：什么症状、用哪个工具、看哪个信号、下一步做什么。
+    </p>
+
+    <div class="box">
+      <span class="box-title">这一页怎么用</span>
+      先读 <a href="#method">方法论</a>，它是所有工具的组织方式；其余章节按你被问到的场景跳读。
+      每一小节最后的<strong>「追问」</strong>就是面试官会接着问的那一句，先自己答一遍。
+    </div>
+
+    <h2 id="map">工具箱地图</h2>
+    <p>
+      面试问「进程挂了你怎么看」，第一句话不该是「我用 gdb」，而是<strong>先判断问题落在哪一层</strong>。
+      这张表是选工具的第一反应：
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>症状</th><th>首选工具</th><th>看什么信号</th><th>下一步</th></tr></thead>
+        <tbody>
+          <tr><td>用户态崩溃</td><td>core + <code>gdb</code>、ASan</td><td>栈顶是否落在自己的代码</td><td>看调用它的那一帧传了什么指针</td></tr>
+          <tr><td>内存只涨不降</td><td>ASan/LSan、valgrind、<code>slabinfo</code></td><td>分配点在涨还是缓存在涨</td><td>抓分配栈，找缺失的 free</td></tr>
+          <tr><td>CPU 慢</td><td><code>perf stat</code> → <code>perf record</code></td><td>IPC、cache-miss 占比</td><td>区分 on-CPU / off-CPU 再优化</td></tr>
+          <tr><td>内核 oops / panic</td><td><code>dmesg</code>、kdump + <code>crash</code></td><td>RIP、Call Trace</td><td>反汇编还原到源码行</td></tr>
+          <tr><td>卡死 / D 状态</td><td><code>sysrq t/w</code>、hung task、lockdep</td><td>所有任务栈、锁依赖环</td><td>找谁持锁、谁在等</td></tr>
+          <tr><td>偶发 / 竞态</td><td><code>ftrace</code>、<code>bpftrace</code>、KCSAN</td><td>事件时序、竞争报告</td><td>把偶发变成可追踪的事件</td></tr>
+          <tr><td>GPU 程序慢</td><td><code>nsys</code> → <code>ncu</code>、<code>nvidia-smi</code></td><td>时间线空隙、SM 利用率、带宽</td><td>先分 CPU 提交还是 GPU 执行</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <strong>追问</strong>：「你说用 ASan，它为什么能看到越界？开销多少？线上能开吗？」
+      —— 答不上原理就说明只是会用工具。每类工具都要知道它<strong>插了什么、慢在哪、能不能上生产</strong>。
+    </p>
+
+    <h2 id="gdb">GDB</h2>
+    <p>
+      GDB 在驱动岗的价值不在「会打断点」，而在两件事：<strong>读崩溃现场</strong>（core），
+      以及<strong>附加到正在跑的进程</strong>。这两件事决定了你能不能处理线上问题。
+    </p>
+
+    <h3 id="gdb-core">崩溃现场：core 与栈的读法</h3>
+    <pre><code>ulimit -c unlimited                        <span class="c"># 默认常是 0，先放开</span>
+echo '/var/crash/core.%e.%p.%t' &gt; /proc/sys/kernel/core_pattern
+
+gdb ./app /var/crash/core.app.<span class="n">1234</span>.<span class="n">1700000000</span>
+(gdb) bt                    <span class="c"># 第 0 帧是出错点，越往下越靠近 main</span>
+(gdb) bt full               <span class="c"># 每帧附带局部变量</span>
+(gdb) frame <span class="n">1</span>                <span class="c"># 栈顶在 libc 里时，看调用它的那一帧</span>
+(gdb) info registers
+(gdb) x/16gx $rsp           <span class="c"># 栈内存，排查栈被踩</span>
+(gdb) info threads</code></pre>
+    <p>
+      读栈的关键判断：<strong>第 0 帧在 <code>memcpy</code>/<code>free</code>/<code>strlen</code> 里，问题通常不在 libc</strong>，
+      而是第 1 帧传进去的指针已经坏了。core 必须和产生它的二进制、共享库版本严格一致，否则栈是错的。
+      如果系统用 <code>systemd-coredump</code>，<code>coredumpctl list</code> + <code>coredumpctl gdb &lt;pid&gt;</code> 直接进调试器。
+    </p>
+    <p>
+      <strong>追问</strong>：「attach 一个进程为什么它停住了？为什么 attach 不了 D 状态的进程？」
+      —— <code>ptrace(PTRACE_ATTACH)</code> 让目标收到 <code>SIGSTOP</code>；D 状态在不可中断睡眠中，
+      信号都投递不进去，所以只能看 <code>/proc/&lt;pid&gt;/stack</code>。
+    </p>
+
+    <h3 id="gdb-opt">优化后的代码怎么调</h3>
+    <p>
+      这是区分度最高的一点。<code>-O2</code> 之后变量被放入寄存器、复用甚至消除，
+      <code>p var</code> 经常返回 <code>&lt;optimized out&gt;</code>。正确做法不是退回 <code>-O0</code>（行为可能变），
+      而是 <strong><code>-Og</code></strong>：为调试优化，保留可读性的同时接近真实执行。
+      再加 <code>-fno-omit-frame-pointer</code>，否则栈回溯会断（<code>perf</code> 也依赖它）。
+    </p>
+    <pre><code>(gdb) disassemble /m my_func    <span class="c"># 汇编与源码交错</span>
+(gdb) p/x $rax                  <span class="c"># 变量此刻可能就在某个寄存器</span></code></pre>
+    <p>
+      真要强力调试时，<code>dprintf handle_io, "fd=%d\n", fd</code> 比断点更轻 —— 不暂停、只打印。
+      把一组断点和打印命令写进脚本，用 <code>gdb -x init.gdb</code> 加载，就是一个轻量的定向打印方案
+      （代价是每次命中都要进内核 ptrace，高频路径别用）。
+      GDB 的 Python pretty-printer 能让 STL 容器直接打印；内核侧则是 <code>vmlinux-gdb.py</code> 提供的
+      <code>lx-ps</code>、<code>lx-dmesg</code>。
+    </p>
+    <p>
+      <strong>追问</strong>：「为什么 <code>-g</code> 和 <code>-O2</code> 一起用，栈还是能看但变量没了？」
+      —— 栈帧布局由 ABI 和 CFI 保证，调试信息还在；变量被优化进寄存器后，DWARF 里只有「某个位置表达式」，
+      gdb 找不到确定的存储位置就报 optimized out。
+    </p>
+
+    <h3 id="gdb-thread">多线程与远程调试</h3>
+    <pre><code>(gdb) thread apply all bt       <span class="c"># 死锁排查第一招</span>
+(gdb) set scheduler-locking on  <span class="c"># 只让当前线程跑，调竞态必备</span>
+(gdb) catch syscall write       <span class="c"># 在系统调用处断住</span>
+
+<span class="c"># 远程：目标机 gdbserver，宿主机 gdb</span>
+gdbserver :<span class="n">1234</span> ./app
+gdb ./app -ex 'target remote <span class="n">192.168.1.10</span>:<span class="n">1234</span>'
+
+<span class="c"># QEMU 内核调试：-s 等价 -gdb tcp::1234，-S 表示启动即冻结</span>
+gdb vmlinux -ex 'target remote :<span class="n">1234</span>'</code></pre>
+    <p>
+      <code>scheduler-locking</code> 是很多人不知道的开关：默认单步时其他线程还在跑，
+      你盯的变量会被别人改掉，看起来像灵异事件。调竞态先把它冻住。
+    </p>
+    <p>
+      <strong>追问</strong>：「<code>detach</code> 和 <code>quit</code> 有什么区别？」
+      —— <code>detach</code> 断开但让进程继续；<code>quit</code> 在 attach 场景下会杀掉进程，事故现场别乱敲。
+    </p>
+
+    <h2 id="kernel">内核调试</h2>
+    <p>
+      内核出错比用户态可怕：<strong>一个进程崩只死一个进程，内核崩死整机</strong>，而且现场默认不保留。
+      这一节的核心问题其实是「<strong>怎么把现场留下来</strong>」。
+    </p>
+
+    <h3 id="oops">读懂 oops</h3>
+    <pre><code>BUG: unable to handle kernel NULL pointer dereference at <span class="n">0000000000000048</span>
+RIP: <span class="n">0010</span>:my_driver_probe+<span class="n">0x1a</span>/<span class="n">0x3f0</span> [my_driver]
+Call Trace:
+ &lt;TASK&gt;
+ ? my_driver_probe+<span class="n">0x1a</span>/<span class="n">0x3f0</span> [my_driver]
+ pci_device_probe+<span class="n">0x8e</span>/<span class="n">0x140</span>
+ really_probe+<span class="n">0x1c5</span>/<span class="n">0x2a0</span></code></pre>
+    <ul>
+      <li><strong>RIP</strong> 是出错指令地址。<code>func+0x1a/0x3f0</code> 表示函数内偏移 0x1a、函数总长 0x3f0。</li>
+      <li>还原源码行：<code>gdb vmlinux -ex 'list *(my_driver_probe+0x1a)'</code>，或 <code>objdump -dS my_driver.ko</code>。</li>
+      <li><strong>Call Trace 里的 <code>?</code> 表示该帧不可靠</strong>（栈被破坏或优化过），不能当事实用。</li>
+      <li>地址是 <code>0x48</code> 这种小值，通常是 <strong>NULL 指针 + 结构体成员偏移</strong> —— 先找那个指针为什么是 NULL。</li>
+      <li>日志里<strong>第一条 error 才是根因</strong>，后面的报错往往是连锁反应。</li>
+    </ul>
+    <p>
+      <strong>追问</strong>：「为什么 Call Trace 会有 <code>?</code>？」——x86 上内核用 frame pointer 回溯，
+      编译器省略 FP、或栈被踩坏时，回溯器只能猜；<code>CONFIG_UNWINDER_ORC</code> 用生成的 unwind 表更可靠，
+      但跨异常栈仍可能不准。
+    </p>
+
+    <h3 id="bugon">BUG_ON、WARN_ON 与 panic()</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>接口</th><th>触发后</th><th>该用在哪</th></tr></thead>
+        <tbody>
+          <tr><td><code>WARN_ON(cond)</code></td><td>打印调用栈，<strong>继续运行</strong></td><td>不变量被破坏但还能继续；线上首选</td></tr>
+          <tr><td><code>BUG_ON(cond)</code></td><td>打印 oops，<strong>杀掉当前进程</strong>；在中断上下文里可能直接 panic</td><td>不可恢复的逻辑错误，线上基本禁用</td></tr>
+          <tr><td><code>panic()</code></td><td>整机停机</td><td>真的没救了，配合 kdump 收现场</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      社区在持续移除 <code>BUG_ON</code>：一个用户能触发的错误就能变成拒绝服务。正确做法是返回错误码，
+      或者降级成 <code>WARN_ON_ONCE</code>。
+    </p>
+    <p>
+      <strong>追问</strong>：「<code>WARN_ON</code> 在中断上下文里安全吗？」——安全，它不睡眠；
+      但<strong>高频 WARN 会拖垮系统</strong>（每次都要抓栈），所以线上要用 <code>_ONCE</code> 变体。
+    </p>
+
+    <h3 id="kdump">把现场留下来：kdump、sysrq、pstore</h3>
+    <p>
+      <strong>kdump</strong> 预留一小块内存跑 crash kernel，主内核 panic 后 kexec 跳过去，
+      把整个内存 dump 成 <code>vmcore</code>。之后用 <code>crash</code> 离线分析：
+    </p>
+    <pre><code>cat /proc/cmdline                 <span class="c"># 应有 crashkernel=256M 之类的预留</span>
+systemctl status kdump
+
+crash /usr/lib/debug/lib/modules/$(uname -r)/vmlinux /var/crash/vmcore
+crash&gt; bt            <span class="c"># panic 时的任务栈</span>
+crash&gt; log           <span class="c"># 完整内核日志，比屏幕上的多</span>
+crash&gt; ps            <span class="c"># 崩溃时刻所有进程</span>
+crash&gt; foreach bt    <span class="c"># 所有任务栈，查 hung</span></code></pre>
+    <p>
+      <strong>sysrq</strong> 是不重启也能取证的开关：
+      <code>echo t &gt; /proc/sysrq-trigger</code> 打印<strong>所有 CPU 的调用栈和所有任务栈</strong>；
+      <code>echo w</code> 只列出 blocked（D 状态）任务；<code>echo l</code> 给所有 CPU 发 NMI 打印栈；
+      <code>echo c</code> 主动 panic 交给 kdump。顺序很重要：<strong>先取证，再杀</strong>。
+    </p>
+    <p>
+      <strong>pstore / ramoops</strong> 把 panic 前的日志写进不掉电的 RAM，重启后从
+      <code>/sys/fs/pstore/</code> 读出。设备侧（车载、手机）用户不会接串口，这是唯一能拿到的现场。
+    </p>
+    <p>
+      <strong>追问</strong>：「<code>dmesg</code> 为什么可能丢日志？」——<code>printk</code> 是 lockless ring buffer，
+      缓冲区满了会覆盖；崩溃瞬间没刷出去的部分直接没了，所以要有 pstore。
+      另外很多系统 <code>dmesg_restrict=1</code>，普通用户读不到。
+    </p>
+
+    <h3 id="hung-lock">卡死：hung task 与 lockdep</h3>
+    <p>
+      <strong>hung task</strong>：内核 <code>khungtaskd</code> 定期扫描处于 <code>TASK_UNINTERRUPTIBLE</code>
+      超过 <code>/proc/sys/kernel/hung_task_timeout_secs</code>（默认 120 秒）的任务并打印栈。
+      看到 <code>INFO: task X blocked for more than N seconds</code>，重点看它<strong>卡在哪个函数、在等什么</strong>。
+      驱动里最常见的原因：在中断上下文里睡眠、等一个永远不会到来的 completion。
+    </p>
+    <p>
+      <strong>lockdep</strong> 是锁依赖图检查器，即使这次没真死锁，也会把「可能成环的加锁顺序」提前报出来：
+    </p>
+    <pre><code>WARNING: possible circular locking dependency detected
+------------------------------------------------------
+kworker/0:1/123 is trying to acquire lock:
+ (&amp;dev-&gt;lock){+.+.}, at: dev_write+<span class="n">0x30</span>/<span class="n">0x80</span>
+
+but task is already holding lock:
+ (&amp;global_lock){+.+.}, at: dev_read+<span class="n">0x20</span>/<span class="n">0x60</span>
+
+ Possible unsafe locking scenario:
+       CPU0                    CPU1
+       ----                    ----
+  lock(&amp;global_lock);
+                               lock(&amp;dev-&gt;lock);
+                               lock(&amp;global_lock);
+  lock(&amp;dev-&gt;lock);</code></pre>
+    <p>
+      读法只有两步：<strong>「trying to acquire」和「already holding」两段合起来就是一个环</strong>；
+      下面的 <em>unsafe locking scenario</em> 把这个环画出来了，照着改加锁顺序即可。
+      花括号里是锁的上下文/中断状态标记，用于判断是否可能在中断里重入。
+      开 lockdep 内核会慢数倍，<strong>只在调试内核开</strong>。
+    </p>
+    <p>
+      <strong>追问</strong>：「用户态死锁没有 lockdep 怎么办？」——<code>thread apply all bt</code>
+      看每个线程停在哪个锁等待上，把「持有 → 等待」连成图看有没有环；
+      再配合 <code>/proc/&lt;pid&gt;/syscall</code> 或 <code>strace -p</code> 确认它卡在 futex。
+    </p>
+
+    <h2 id="ftrace">ftrace 与 tracepoint</h2>
+    <p>
+      ftrace 是<strong>内核内置</strong>的追踪框架，不用装东西、不用重编内核，通过 debugfs 操作。
+      它的最佳场景是：<strong>问题偶发，但你知道该盯哪几个函数或事件</strong>。
+    </p>
+
+    <h3 id="ftrace-flow">配置流程</h3>
+    <pre><code>cd /sys/kernel/debug/tracing      <span class="c"># 新内核也可能是 /sys/kernel/tracing</span>
+
+cat available_tracers             <span class="c"># function function_graph nop ...</span>
+echo nop &gt; current_tracer         <span class="c"># 换 tracer 前必须先回到 nop</span>
+
+echo 'my_driver_ioctl' &gt; set_ftrace_filter   <span class="c"># 只追踪它，开销立刻降下来</span>
+echo function_graph &gt; current_tracer
+echo 1 &gt; tracing_on
+<span class="c"># ... 复现 ...</span>
+echo 0 &gt; tracing_on
+cat trace</code></pre>
+    <p>
+      <code>trace</code> 是缓冲区快照，读完不清空；<code>trace_pipe</code> 是<strong>消费式</strong>的，
+      适合 <code>tail -f</code> 实时观察偶发问题。两者用途不同，别混。
+    </p>
+    <p>
+      <strong>追问</strong>：「为什么 <code>set_ftrace_filter</code> 这么重要？」——function tracer
+      给<strong>所有函数</strong>入口插桩，全开能带来几十个百分点的开销，还会把真正的问题淹掉。
+    </p>
+
+    <h3 id="ftrace-graph">function_graph 与 tracepoint</h3>
+    <p>
+      <code>function_graph</code> 画出调用树并标注每个函数耗时，是找「哪一层慢」最快的办法。
+      用 <code>set_graph_function</code> 限定子树。输出里 <code>+</code> 标记耗时超过 10 微秒，
+      <code>!</code> 超过 100 微秒，<code>#</code> 超过 1 毫秒（由 <code>funcgraph-overhead</code> 选项控制显隐）：
+    </p>
+    <pre><code>echo 'vfs_read' &gt; set_graph_function
+<span class="c">#  0) + 12.345 us   |    my_read();</span>
+<span class="c">#  0)   0.512 us    |    rw_verify_area();</span>
+
+<span class="c"># tracepoint：内核预埋的事件，语义稳定、开销低</span>
+echo 1 &gt; events/sched/sched_switch/enable
+echo 1 &gt; events/irq/enable</code></pre>
+    <p>
+      <code>sched_switch</code> 是分析延迟的神器：它记录了<strong>谁把 CPU 让给谁、前一个任务是什么状态</strong>
+      （<code>prev_state</code> 是 D 还是 R）—— off-CPU 时间就是从这里算出来的。
+      文本操作太啰嗦时用 <code>trace-cmd record -p function_graph -l my_func -- ./app</code>，
+      再 <code>kernelshark</code> 看时间线。
+    </p>
+    <p>
+      <strong>追问</strong>：「ftrace 和 perf 是什么关系？」——ftrace 是内核内的 tracing 框架，事件驱动、每次发生都记；
+      perf 主要基于 PMU 采样，但也能读 tracepoint（<code>-e sched:sched_switch</code>）。
+      两者不是竞品，短事件用 ftrace / eBPF，统计热点用 perf。
+    </p>
+
+    <h2 id="perf">perf 与 eBPF</h2>
+
+    <h3 id="perf-stat">perf stat：先拿宏观指标</h3>
+    <pre><code>perf stat -e cycles,instructions,cache-misses,branch-misses ./app
+<span class="c">#   1,234,567,890   cycles</span>
+<span class="c">#     987,654,321   instructions   # 0.80 insn per cycle</span></code></pre>
+    <ul>
+      <li><strong>IPC = instructions / cycles</strong>。IPC 低说明 CPU 在等（cache miss、分支预测失败、内存延迟）；</li>
+      <li>IPC 不低但程序慢，说明<strong>指令太多</strong>，是算法层面的问题，优化方向完全不同；</li>
+      <li><code>cache-misses</code> 占比高 = 数据局部性差；<code>branch-misses</code> 高 = 分支不可预测。</li>
+    </ul>
+    <p>
+      <strong>追问</strong>：「IPC 0.8 说明什么？」——不能单独下结论。要看 CPU 基线（不同微架构差异大）、
+      是否超线程共享、以及 <code>%usr</code> 是否真的高。IPC 只是「每周期退休多少指令」，必须结合 cache 和 stall 指标一起读。
+    </p>
+
+    <h3 id="perf-record">perf record：定位到函数，以及采样为什么会骗你</h3>
+    <pre><code>perf record -F 999 -g --call-graph dwarf -o perf.data -- ./app
+perf report --stdio --sort=dso,symbol
+perf top -p <span class="n">12345</span>
+perf trace -p <span class="n">12345</span>        <span class="c"># 基于 tracepoint 看系统调用耗时，比 strace 开销低</span></code></pre>
+    <p>
+      原理：<strong>PMU 计数器溢出触发中断，内核在中断里记录当前 IP 和调用栈</strong>。
+      所以它是<strong>概率采样</strong>：函数耗时占比约等于出现比例。
+      三个必须知道的偏差来源：
+    </p>
+    <ul>
+      <li><strong>短函数采不到</strong>：只跑 1 微秒的函数，在 1000Hz 下基本不出现。要么提高频率，要么用 ftrace / eBPF 的事件驱动方式。</li>
+      <li><strong>skid（滑移）</strong>：中断到达时 CPU 已经走过几条指令，热点会偏向后一条指令，看汇编时要容忍。</li>
+      <li><strong>栈展开方式</strong>：默认 <code>fp</code> 依赖 <code>-fno-omit-frame-pointer</code>，否则栈是断的；
+        <code>--call-graph dwarf</code> 更准但每次采样都要查 unwind 表，<strong>慢且数据大</strong>。</li>
+    </ul>
+    <p>
+      <strong>追问</strong>：「<code>perf report</code> 里大量 <code>[unknown]</code> 怎么回事？」
+      —— 通常是栈展开失败（省了 frame pointer 或 DWARF 不匹配），或者二进制没有符号；
+      先 <code>perf buildid-cache</code> 补符号，再换 <code>--call-graph dwarf</code>。
+    </p>
+
+    <h3 id="flame">火焰图：on-CPU 与 off-CPU</h3>
+    <pre><code>perf record -F 999 -g -- sleep 30
+perf script &gt; out.perf
+stackcollapse-perf.pl out.perf &gt; out.folded
+flamegraph.pl out.folded &gt; flame.svg</code></pre>
+    <p>
+      读法：<strong>横轴是采样频率（不是时间）</strong>，宽度代表占比，纵轴是调用深度。
+      找最宽的「平顶」——那是自己吃满 CPU 的函数。
+    </p>
+    <div class="box">
+      <span class="box-title">第一个分叉点：on-CPU 还是 off-CPU</span>
+      上面的火焰图只包含<strong>在 CPU 上跑的时间</strong>。如果程序慢在等 IO / 等锁，
+      on-CPU 图会显得「很干净」——因为它根本没在跑。此时要画 <strong>off-CPU</strong>：
+      用 BCC 的 <code>offcputime</code>（或 <code>bpftrace</code> 在 <code>sched_switch</code> 上统计阻塞栈）。
+      <strong>「CPU 不忙但程序慢」= off-CPU 问题</strong>，这是排查的第一次分叉。
+    </div>
+    <p>
+      <strong>追问</strong>：「火焰图能不能看出内存带宽瓶颈？」——不能直接看出。它只给时间分布，
+      带宽问题要配合 <code>perf stat</code> 的 cache-misses 或 <code>perf mem</code> 才能确认。
+    </p>
+
+    <h3 id="bpf">bpftrace：让内核按你的问题报数</h3>
+    <pre><code><span class="c"># openat 的延迟分布（纳秒直方图）；用 tracepoint 最稳，不依赖内核内部函数名</span>
+bpftrace -e '
+tracepoint:syscalls:sys_enter_openat { @start[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_openat /@start[tid]/ {
+  @ns = hist(nsecs - @start[tid]); delete(@start[tid]);
+}'
+
+<span class="c"># 谁在 open，按进程计数</span>
+bpftrace -e 'tracepoint:syscalls:sys_enter_openat { @[comm] = count(); }'</code></pre>
+    <p>
+      它能上生产的关键是 <strong>eBPF verifier</strong>：加载前静态检查所有路径 ——
+      不允许越界访问、不允许无界循环、不允许读未初始化内存，通过后才 JIT 挂到 hook 上。
+      所以它比内核模块安全得多。内核版本太老或没有 BTF 时只能用 ftrace。
+    </p>
+    <p>
+      <strong>追问</strong>：「eBPF 能完全替代 ftrace 吗？」——不能。ftrace 是内核原生、无需编译，
+      在最小化环境里更可靠；eBPF 更灵活但依赖内核版本、BTF 和额外工具链。
+    </p>
+
+    <h2 id="mem">内存问题</h2>
+    <p>
+      内存问题的特点是<strong>症状和原因隔得很远</strong>：分配在这里，崩溃在几百行之后。
+      所有工具的目标都只有一个：<strong>把分配点和崩溃点关联起来</strong>。
+    </p>
+
+    <h3 id="userspace-mem">用户态：先选工具，再看信号</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>工具</th><th>管什么</th><th>原理 / 开销</th><th>什么时候用</th></tr></thead>
+        <tbody>
+          <tr><td><strong>valgrind memcheck</strong></td><td>越界、use-after-free、未初始化读、泄漏</td><td>动态二进制翻译，慢 20-50 倍</td><td>拿到已编好的二进制、要最全的检查</td></tr>
+          <tr><td><strong>ASan</strong></td><td>堆/栈/全局越界、use-after-free</td><td>编译期插桩 + 红区，约 2x，内存 2-3x</td><td>测试环境首选，只检查真正执行到的路径</td></tr>
+          <tr><td><strong>LSan</strong></td><td>内存泄漏</td><td>退出时扫描不可达但未释放的块，开销低</td><td>常和 ASan 一起开</td></tr>
+          <tr><td><strong>UBSan</strong></td><td>未定义行为（有符号溢出、空指针、对齐）</td><td>编译期检查，约 1.2x</td><td>CI 常驻</td></tr>
+          <tr><td><strong>TSan</strong></td><td>数据竞争</td><td>记录访问 + happens-before 图，5-15x</td><td>并发 bug，见 <a href="#race">并发</a></td></tr>
+          <tr><td><strong>MSan</strong></td><td>未初始化内存读</td><td>影子内存标记每个 bit，约 3x</td><td>valgrind 太慢、又需要这类检查时</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <pre><code>g++ -fsanitize=address,undefined -fno-omit-frame-pointer -g app.cc
+<span class="c"># 报错会同时给出：freed by 的栈 + previously allocated by 的栈</span></code></pre>
+    <p>
+      注意 ASan 和 valgrind <strong>不能同时开</strong>，两者都接管内存管理，会互相打架。
+      Python 侧用标准库的 <code>tracemalloc</code>：<code>tracemalloc.start()</code> 后在两个时间点取
+      <code>snapshot()</code> 做 diff，按行号看谁在增长，不用装额外工具。
+    </p>
+    <p>
+      <strong>追问</strong>：「RSS 一直涨一定是泄漏吗？」——不一定。glibc arena 不归还、page cache、
+      内存碎片都会让 RSS 涨。要区分<strong>单调上涨且反复触发后不回落</strong>，才是泄漏。
+    </p>
+
+    <h3 id="kasan">内核：KASAN 与泄漏检测</h3>
+    <p>
+      KASAN 是内核版 ASan，用<strong>影子内存</strong>标记每 8 字节是否可访问，每次访问插桩检查。
+      开销约 <strong>CPU 2-3 倍、内存 1/8</strong>（影子比例 1:8），驱动开发时几乎必开。
+      抓 use-after-free、越界、栈溢出都比事后猜可靠得多。
+    </p>
+    <ul>
+      <li><strong>KFENCE</strong>：采样版检测器，开销低到可以上生产，适合抓偶发越界。</li>
+      <li><strong>KCSAN</strong>：内核数据竞争检测，原理类似 TSan。</li>
+      <li><strong>kmemleak</strong>：扫描「分配了但没有指针指向」的内存，<code>echo scan &gt; /sys/kernel/debug/kmemleak</code> 后读结果；内核会变慢，只在调试内核开。</li>
+      <li><strong>slab 泄漏</strong>：<code>slabtop -s c</code>（按 cache 大小排序），或 <code>watch -n 1 'grep my_cache /proc/slabinfo'</code>，看哪个 cache 持续增长。</li>
+    </ul>
+    <p>
+      <strong>追问</strong>：「为什么 KASAN 能立刻抓到 use-after-free，而普通内核可能跑几天才崩？」
+      —— 释放的内存不会立刻被复用，普通内核里那块内容可能一直是旧值，读它「看起来正常」；
+      KASAN 在释放时就把影子标记为不可访问，下一次访问立即报错。
+    </p>
+
+    <h3 id="oom">OOM killer 日志怎么读</h3>
+    <pre><code>Out of memory: Killed process 1234 (python) total-vm:8388608kB,
+anon-rss:4194304kB, file-rss:0kB, shmem-rss:0kB</code></pre>
+    <p>
+      看四件事：<strong>杀的是谁</strong>（名字 + RSS）、<strong>它为什么分高</strong>
+      （<code>oom_score</code> 大致正比于内存占用，再加上 <code>oom_score_adj</code>）、
+      <strong>当时内存状态</strong>（往前翻 <code>dmesg</code> 的 meminfo）、<strong>是不是 cgroup 限制</strong>
+      （容器里可能是 memory cgroup OOM，不是整机内存不够）。
+    </p>
+    <p>
+      <code>/proc/meminfo</code> 只看两个字段就够定位：<code>MemAvailable</code>（真正可用，
+      已把可回收的 page cache / slab 算进去，比 <code>MemFree</code> 靠谱）和 <code>Dirty</code>（待写回，过高会卡 IO）。
+    </p>
+    <p>
+      <strong>追问</strong>：「<code>MemFree</code> 很低但系统很健康，正常吗？」——正常，Linux 会主动用空闲内存做缓存；
+      判断内存是否不足要看 <code>MemAvailable</code> 和有没有发生回收/swap。
+    </p>
+
+    <h2 id="race">并发问题定位</h2>
+    <p>
+      并发问题的本质难点是<strong>不可复现</strong>。工具只有两类：
+      <strong>检测器</strong>（TSan / KCSAN，告诉你「这里有竞争」）和
+      <strong>复现器</strong>（stress、rr，把偶发变成必然）。
+    </p>
+
+    <h3 id="deadlock">死锁：先确认环，再谈避免</h3>
+    <p>
+      确认顺序：① <code>ps -eo pid,stat,wchan:32,cmd</code> 找出 D 状态；
+      ② <code>gdb -p</code> + <code>thread apply all bt</code>（或内核侧 sysrq <code>w</code> / crash <code>foreach bt</code>）拿所有栈；
+      ③ 把「持有锁 → 等待锁」连成图，看有没有环；④ 内核侧直接看 lockdep 画出的环。
+    </p>
+    <p>
+      <strong>避免</strong>：全局定义加锁顺序并强制遵守；一次性锁多个用 <code>std::lock</code>；
+      用 scope 限制持锁时间；拿不到锁时有超时/退避；内核里开发期始终开 lockdep。
+    </p>
+    <p>
+      <strong>追问</strong>：「加锁顺序文档写了，为什么还会出问题？」——跨模块调用时没人强制执行，
+      只能靠工具检查。<strong>能主动说「我们用 lockdep / 静态检查来保证顺序」</strong>，比背四要素强。
+    </p>
+
+    <h3 id="datarace">数据竞争：TSan、KCSAN 与 atomic 误用</h3>
+    <pre><code>g++ -fsanitize=thread -g app.cc -o app    <span class="c"># 用户态 TSan</span>
+<span class="c"># 报告会给出「哪次写」「哪次读」并发，以及双方调用栈</span></code></pre>
+    <p>
+      TSan 给每次内存访问打时间戳、维护 happens-before 图，没有同步关系的并发访问就报。
+      它会把<strong>所有</strong>未加锁的地方都报出来，需要自己判断哪些真正影响正确性
+      （比如纯统计计数，可能无害但仍算竞争）。
+    </p>
+    <p>
+      内核侧用 <strong>KCSAN</strong>（<code>CONFIG_KCSAN=y</code>），报 <code>BUG: KCSAN: data-race in ...</code>。
+      最常见的误用不是「忘了 atomic」，而是<strong>以为 atomic 能保护复合操作</strong>：
+      <code>if (x.load() == 0) x.store(1);</code> 是两次原子操作，两个线程能同时进；
+      以及把 <code>seq_cst</code> 随手改成 <code>relaxed</code> 却没有正确的同步语义。
+    </p>
+    <p>
+      <strong>追问</strong>：「TSan 报的竞争一定要修吗？」——要看是否存在 happens-before 之外的同步
+      （比如靠信号量、或者只在启动阶段访问）。但<strong>不能靠「看起来没事」来放过</strong>，
+      要么加同步，要么用 <code>atomic</code> 明确标注。
+    </p>
+
+    <h3 id="repro">复现：把偶发变成必然</h3>
+    <pre><code>rr record ./app
+rr replay
+(rr) reverse-continue        <span class="c"># 反向执行，从崩溃点往回追</span></code></pre>
+    <ul>
+      <li><strong>rr</strong>：记录一次执行的所有非确定性输入（调度、系统调用返回值、信号），之后可反复重放、还能倒着走。对多核和 GPU 交互支持有限，但 CPU 侧的竞态几乎是杀手锏。</li>
+      <li><strong>压力</strong>：<code>stress-ng --cpu 8 --io 4 --vm 2</code> 制造竞争窗口，把 1 天 1 次变成 1 分钟 1 次。</li>
+      <li><strong>固定变量</strong>：<code>taskset</code> 绑核、固定随机种子、关频率调节，减少不确定性。</li>
+      <li><strong>加检测器</strong>：KASAN / TSan 把「静默损坏」变成「当场报错」。</li>
+    </ul>
+    <p>
+      <strong>追问</strong>：「rr 为什么能倒着执行？」——它记录了每个线程的执行顺序和外部输入，
+      重放时在每个检查点保留快照，反向执行靠恢复最近快照再正向跑到目标点，对用户透明。
+    </p>
+
+    <h2 id="gpu">GPU 性能分析</h2>
+    <p>
+      GPU 程序慢，第一步永远是分叉：<strong>CPU 没喂饱 GPU，还是 GPU 自己算得慢</strong>？
+      前者用 Nsight Systems 看时间线，后者用 Nsight Compute 看单个 kernel。
+    </p>
+
+    <h3 id="nsys">Nsight Systems：先看时间线</h3>
+    <pre><code>nsys profile -o report --trace=cuda,nvtx,osrt ./app
+nsys stats report.nsys-rep</code></pre>
+    <p>看三条泳道：<strong>CPU 的 API 调用、GPU 的 kernel 执行、显存拷贝</strong>。判断规则：</p>
+    <ul>
+      <li>GPU 泳道大段空白、CPU 在忙 → <strong>CPU 端瓶颈</strong>（launch 开销、Python、其他计算）；</li>
+      <li>CPU 卡在 <code>cudaDeviceSynchronize</code> 或 <code>cudaMemcpy</code> → <strong>同步/传输瓶颈</strong>；</li>
+      <li>kernel 之间只有微小间隙 → launch 开销，考虑 CUDA Graphs 或融合 kernel；</li>
+      <li>拷贝与计算串行 → 多 stream + pinned memory 做重叠。</li>
+    </ul>
+    <p>
+      <strong>追问</strong>：「怎么区分 launch 开销和 kernel 真的慢？」——看时间线：GPU 上空隙明显且 kernel 本身很短，
+      就是 launch 开销；kernel 占满时间就进 <code>ncu</code> 看内部。
+    </p>
+
+    <h3 id="ncu">Nsight Compute：单 kernel 的三个指标</h3>
+    <pre><code>ncu -k my_kernel --launch-count 1 --set full ./app
+ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed \
+        dram__throughput.avg.pct_of_peak_sustained_elapsed ./app</code></pre>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>指标</th><th>含义</th><th>低说明什么</th></tr></thead>
+        <tbody>
+          <tr><td>Compute / SM 利用率</td><td>计算单元有多忙</td><td>算得不多，或在等内存</td></tr>
+          <tr><td>Memory Throughput</td><td>显存 / L2 带宽用了多少</td><td>不是带宽瓶颈</td></tr>
+          <tr><td>Occupancy</td><td>实际活跃 warp / 理论最大</td><td>隐藏不了延迟；查寄存器、shared memory、block size</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      判断顺序：<strong>SM 低 + Memory 高 = 带宽瓶颈</strong>（合并访问、shared memory、减少重复读）；
+      <strong>SM 低 + Memory 低 + Occupancy 低 = 占用率不足</strong>（减寄存器、调 block）；
+      <strong>SM 高 = 计算瓶颈</strong>（改算法或指令）。
+    </p>
+    <p>
+      <strong>追问</strong>：「<code>nvidia-smi</code> 显示 100% 利用率，为什么程序还是慢？」
+      —— 那个 util 的含义是「采样周期内是否有 kernel 在跑」，一个 block 的 kernel 也能让它显示 100%。
+      它衡量忙不忙，不衡量效率，真正的效率要看 SM 效率和带宽。
+    </p>
+
+    <h3 id="gpu-bottleneck">常见瓶颈与假象</h3>
+    <ul>
+      <li><strong>隐式同步</strong>：<code>cudaMalloc</code>、<code>cudaFree</code>、默认的 <code>cudaMemcpy</code> 都可能同步，打断流水。</li>
+      <li><strong>PCIe 往返</strong>：host-device 来回搬数据；用 pinned memory、减少拷贝、考虑 Unified Memory。</li>
+      <li><strong>访存不合并</strong>：coalescing 差、bank conflict，带宽看起来满但有效吞吐低。</li>
+      <li><strong>occupancy 低</strong>：<code>--ptxas-options=-v</code> 看寄存器和 shared memory 用量。</li>
+      <li><strong>降频</strong>：<code>nvidia-smi -q -d PERFORMANCE</code> 看是否 throttle（功耗/温度）。</li>
+    </ul>
+    <p>
+      现场观测用 <code>nvidia-smi dmon -s pucvmet</code>（功耗、利用率、显存、温度、时钟），
+      拓扑用 <code>nvidia-smi topo -m</code>（<code>NV#</code> = NVLink，<code>SYS</code> = 跨 NUMA）。
+    </p>
+    <p>
+      <strong>追问</strong>：「GPU 利用率高但吞吐上不去，可能是哪些原因？」
+      —— 先从「有效带宽 / 有效算力」而不是「util」出发：访存不合并、occupancy 不足、
+      kernel 太小导致调度开销占比高、或者被 CPU 侧的同步切碎了。
+    </p>
+
+    <h2 id="method">方法论（最重要的一节）</h2>
+    <p>
+      前面都是工具。资深面试真正考的是：<strong>没有现成工具能解的问题，你怎么办</strong>。
+      下面几条可以直接背，也真的管用。
+    </p>
+
+    <h3 id="layers">先分层，不要一上来就 gdb</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>层</th><th>最便宜的确认手段</th><th>典型现象</th></tr></thead>
+        <tbody>
+          <tr><td>应用逻辑</td><td>日志、线程栈</td><td>死循环、等一个永不满足的条件</td></tr>
+          <tr><td>运行时 / 库</td><td><code>strace</code> / <code>ltrace</code></td><td>卡在某个 <code>futex</code> / <code>read</code></td></tr>
+          <tr><td>内核 / 驱动</td><td>D 状态、<code>sysrq t</code>、<code>dmesg</code></td><td>卡在 <code>ioctl</code>、等锁、等 DMA</td></tr>
+          <tr><td>硬件 / 固件</td><td><code>dmesg</code>、<code>nvidia-smi -q</code></td><td>掉卡、降频、PCIe 错误</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      第一步永远是用最便宜的手段<strong>确定层</strong>：<code>ps</code> 看状态、<code>strace -p</code> 看最后停在哪、
+      <code>dmesg</code> 看有没有报错。<strong>定位到层，问题就解决了一半</strong>；在错误的层上折腾 gdb 纯属浪费。
+    </p>
+
+    <h3 id="measure">测量代替猜测</h3>
+    <p>
+      「我觉得是内存带宽」「我觉得是锁竞争」——面试里最减分的就是这种话。
+      正确姿势是<strong>先说假设，再说怎么验证</strong>：
+      「我怀疑是 cache miss，所以先跑 <code>perf stat -e cache-misses</code>；
+      如果占比高，再用 <code>perf record -e LLC-load-misses -g</code> 找具体位置。」
+    </p>
+    <div class="box ok">
+      <span class="box-title">一个可复用的回答模板</span>
+      <strong>假设</strong>：我认为瓶颈在 X。<br>
+      <strong>证据</strong>：用 Y 工具测，Z 指标是 A（基线是 B）。<br>
+      <strong>验证</strong>：如果改成 C，指标应该变成 D；实测吻合，所以假设成立。<br>
+      按这个结构说话，面试官听到的是工程师，不是工具使用者。
+    </div>
+
+    <h3 id="bisect">二分法与最小复现</h3>
+    <ul>
+      <li><strong>代码二分</strong>：<code>git bisect</code> 定位引入问题的 commit。</li>
+      <li><strong>配置 / 环境二分</strong>：换机器、内核、驱动、CPU 型号；一次只改一个变量。</li>
+      <li><strong>输入二分</strong>：缩小数据规模、线程数、场景，直到剩下最小可复现的输入。</li>
+    </ul>
+    <p>
+      花 20% 的时间做一个稳定的最小复现，能省下 80% 的调试时间。
+      驱动问题尤其如此：一个几十行的 ioctl 测试程序 + 循环脚本，
+      能把「一天一次」变成「一分钟一次」，之后所有工具才真正可用。
+    </p>
+
+    <h3 id="timeline">记录时间线与读日志</h3>
+    <p>
+      被问「线上昨天开始变慢，怎么查」，第一个动作应该是问：
+      <strong>什么时候开始的？之前改了什么？</strong>
+      部署、配置、内核 / 驱动升级、流量变化、硬件更换 —— 这六个变量的时间点对上问题出现的时间点，
+      往往比任何 profiling 都快。
+    </p>
+    <div class="box danger">
+      <span class="box-title">最常犯的错误：盯着最密集的日志</span>
+      一堆错误里，<strong>第一条才是根因</strong>，后面多是连锁反应。
+      比如内存分配失败导致后续全报空指针，真正要查的是第一条 <code>ENOMEM</code>。
+      顺序应该是：<strong>按时间正序找到第一处异常</strong> → 看它前后上下文
+      （<code>dmesg -T | less</code>、<code>journalctl -k --since</code>）→ 再统计数量。
+    </div>
+
+    <h3 id="use-red">USE 与 RED</h3>
+    <div class="grid grid-2">
+      <div class="card">
+        <h3 id="use">USE（资源视角）</h3>
+        <p>对每个资源（CPU、内存、磁盘、网卡、GPU）各看三个维度，任一异常就往下钻。</p>
+        <div class="meta"><span class="tag blue">Utilization</span><span>使用率</span></div>
+        <div class="meta"><span class="tag amber">Saturation</span><span>排队/积压</span></div>
+        <div class="meta"><span class="tag red">Errors</span><span>错误计数</span></div>
+      </div>
+      <div class="card">
+        <h3 id="red">RED（服务视角）</h3>
+        <p>对每个服务或接口各看三个维度，适合定位「用户感知的慢」在哪里。</p>
+        <div class="meta"><span class="tag blue">Rate</span><span>请求速率</span></div>
+        <div class="meta"><span class="tag red">Errors</span><span>错误率</span></div>
+        <div class="meta"><span class="tag green">Duration</span><span>延迟分布</span></div>
+      </div>
+    </div>
+    <p>
+      USE 找「哪个资源是瓶颈」，RED 找「哪个服务/接口是瓶颈」，两个一起用覆盖面才完整。
+    </p>
+    <p>
+      <strong>追问</strong>：「给你一个从没见过的线上问题，前 10 分钟怎么用？」
+      —— 好答案的顺序是：<strong>确认影响面 → 看时间线 → 分层 → 再上工具</strong>；
+      并且要主动说出「<strong>先止血（回滚/限流/重启），再定位</strong>」。
+      一上来就说「我用 gdb」的，通常没真正处理过线上事故。
+    </p>
+
+    <h2 id="qa">高频问答</h2>
+
+    <details class="qa">
+      <summary>进程 hang 住了，你怎么排查？</summary>
+      <div class="a">
+        <p><strong>看状态</strong>：<code>ps -o pid,stat,wchan:32,cmd -p &lt;pid&gt;</code>。
+        <code>R</code> = 死循环在跑，<code>D</code> = 卡在内核（等 IO/锁），<code>S</code> = 正常睡眠等待。</p>
+        <p><strong>看栈</strong>：用户态 <code>gdb -p</code> + <code>thread apply all bt</code>；
+        D 状态 attach 不上时看 <code>/proc/&lt;pid&gt;/stack</code> 和 <code>/proc/&lt;pid&gt;/wchan</code>。</p>
+        <p><strong>看系统调用</strong>：<code>strace -p</code> 或 <code>cat /proc/&lt;pid&gt;/syscall</code>，确认它停在哪个调用。</p>
+        <p><strong>看依赖</strong>：所有线程都在 futex → 死锁或活锁；等网络 → 对端没响应；D 状态 + 磁盘 → IO。</p>
+        <p><strong>追问点</strong>：能说清「怎么区分死锁和仅仅在等 IO」，比背命令重要。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>内核 panic 了，怎么定位到具体代码行？</summary>
+      <div class="a">
+        <p><strong>拿现场</strong>：<code>dmesg</code> / 串口 / pstore；有 kdump 就 <code>crash vmlinux vmcore</code>，
+        用 <code>bt</code> 和 <code>log</code> 拿完整日志。</p>
+        <p><strong>读 RIP</strong>：<code>func+0x1a/0x3f0</code> 给出函数内偏移，用
+        <code>gdb vmlinux -ex 'list *(func+0x1a)'</code> 或 <code>objdump -dS vmlinux</code> 还原到源码行。</p>
+        <p><strong>读 Call Trace</strong>：<code>?</code> 标记的帧不可靠；地址是小值（如 <code>0x48</code>）通常是
+        NULL + 成员偏移，去找那个指针为什么为 NULL。</p>
+        <p><strong>看 panic 之前</strong>：往往先有 WARNING / BUG / lockdep 报告，真正的根因在几条日志之前。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>怎么证明一个性能问题是 CPU 还是 IO 瓶颈？</summary>
+      <div class="a">
+        <p><strong>先看 CPU 忙不忙</strong>：<code>mpstat -P ALL 1</code>。<code>%usr + %sys</code> 都低，
+        说明在等 —— 那就是 IO 或锁。</p>
+        <p><strong>看 on-CPU 火焰图</strong>：<code>perf record -g</code> 采到的栈很薄，
+        说明进程大部分时间不在 CPU 上 → off-CPU 问题。</p>
+        <p><strong>看等待</strong>：<code>pidstat -u -d 1</code> 看 <code>%wait</code>/<code>iowait</code>；
+        <code>iostat -x 1</code> 看磁盘 <code>%util</code> 和 <code>await</code>。</p>
+        <p><strong>做对照</strong>：把 IO 换成缓存命中，如果显著变快就是 IO；加并发后 CPU 满了但吞吐不涨，
+        说明瓶颈不在 CPU。</p>
+        <p><strong>算 IPC</strong>：<code>perf stat</code> 的 IPC 高但慢 = 指令多；IPC 低 = 在等内存/cache/分支。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>perf 采样不准怎么办？</summary>
+      <div class="a">
+        <p><strong>先认清这是采样本质</strong>：短函数采不到、热点偏向后一条指令（skid），不是 bug。</p>
+        <p><strong>提高频率</strong>：<code>-F 9999</code>，但受 <code>/proc/sys/kernel/perf_event_max_sample_rate</code> 限制，且开销上升。</p>
+        <p><strong>换事件源</strong>：<code>-e cpu-clock</code> 或 <code>-e cycles:u</code> 只统计用户态。</p>
+        <p><strong>换方法</strong>：短函数/事件型问题用 ftrace / bpftrace，事件驱动、不依赖采样。</p>
+        <p><strong>查栈展开</strong>：大量 <code>[unknown]</code> 说明 <code>fp</code> 展开失败，换 <code>--call-graph dwarf</code> 或补符号。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>内存泄漏怎么查？</summary>
+      <div class="a">
+        <p><strong>先确认是泄漏</strong>：反复触发后 RSS 单调上涨且不回落；区分 page cache / arena 可回收占用。</p>
+        <p><strong>用户态</strong>：测试环境用 ASan + LSan（快、给分配栈），或 valgrind <code>--leak-check=full</code>（最全但慢）；
+        线上可采样或用 heaptrack。</p>
+        <p><strong>内核态</strong>：<code>/proc/slabinfo</code> / <code>slabtop -s c</code> 看增长的 cache；
+        <code>kmemleak</code> 扫描不可达分配；<code>slub_debug</code> 检查越界。</p>
+        <p><strong>核心</strong>：找到<strong>分配点</strong>而不是盯着内存增长，确认每条分配路径都有对应释放。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>死锁怎么确认、怎么避免？</summary>
+      <div class="a">
+        <p><strong>确认</strong>：所有线程停在锁等待（futex / <code>__lll_lock_wait</code>），
+        且「持有 → 等待」能连成环。内核里 lockdep 直接画出环；用户态靠 <code>thread apply all bt</code> 人工分析。</p>
+        <p><strong>区分活锁</strong>：死锁是大家不动；活锁是都在跑但没进展（不停让出、重试）。</p>
+        <p><strong>避免</strong>：全局加锁顺序；<code>std::lock</code> 一次性锁多个；scope 限制持锁范围；
+        超时/退避；内核里始终开 lockdep。</p>
+        <p><strong>追问点</strong>：为什么「文档写了顺序」还会出问题？因为跨模块调用无人强制 —— 要靠工具。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>GPU 程序比预期慢，你怎么定位？</summary>
+      <div class="a">
+        <p><strong>先分叉</strong>：<code>nsys</code> 看时间线，判断是 CPU 提交、数据传输，还是 GPU 执行慢。</p>
+        <p><strong>CPU 侧</strong>：频繁同步（<code>cudaDeviceSynchronize</code>、隐式同步的 <code>cudaMemcpy</code>/<code>cudaMalloc</code>）、
+        kernel 太小 launch 太频繁、Python/GIL 拖慢。用 stream、pinned memory、CUDA Graphs 修。</p>
+        <p><strong>GPU 侧</strong>：<code>ncu</code> 看 SM 利用率、显存带宽、occupancy：
+        SM 低 + Mem 高 = 带宽；SM 低 + Occupancy 低 = 占用率；SM 高 = 计算。</p>
+        <p><strong>别被假象骗</strong>：<code>nvidia-smi</code> 的 100% 只是「有 kernel 在跑」，不代表高效。</p>
+      </div>
+    </details>
+
+    <div class="box ok" style="margin-top:34px">
+      <span class="box-title">下一步</span>
+      去 <a href="../quiz/index.html?cat=sysdebug">刷调试专题</a>。全部读完的话，回到 <a href="../index.html">首页</a> 按 8 周计划复盘。
+    </div>
+  </main>
+</div>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

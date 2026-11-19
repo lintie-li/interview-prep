@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Linux 内核与驱动 · 面试准备</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="kernel">
+<div id="topbar" data-base="../"></div>
+<div style="position:sticky;top:56px;z-index:49;height:3px;background:transparent"><i id="read-bar" style="display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--purple))"></i></div>
+
+<div class="wrap">
+<div class="layout">
+  <aside class="sidebar"><div id="toc"></div></aside>
+
+  <main class="content">
+    <h1>Linux 内核与驱动</h1>
+    <p style="color:var(--text-dim);font-size:15.5px">
+      这是整条线的地基。NVIDIA 每一条 JD 里都出现了 "kernel", "device driver model",
+      "memory management", "synchronization and concurrency" —— 而且都是 <strong>in-depth</strong>。
+    </p>
+
+    <div class="box">
+      <span class="box-title">这一页怎么用</span>
+      不需要从头读到尾。先看 <a href="#numbers">重要数字</a> 和 <a href="#concurrency">并发</a>，
+      这两块是面试里"一追问就露底"的地方。然后按你面到的岗位挑章节。
+    </div>
+
+    <h2 id="numbers">先背下这些数字</h2>
+    <p>资深岗的面试官喜欢用具体数值验证你是不是真的在系统层干过。这些必须条件反射：</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>项目</th><th>x86-64</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>基础页大小</td><td>4 KB</td><td>huge page 2 MB / 1 GB</td></tr>
+          <tr><td>内核栈</td><td>16 KB（4 个 4K 页）</td><td>32 位时代是 8 KB；所以内核里禁止大栈变量、禁止递归</td></tr>
+          <tr><td>用户栈默认</td><td>8 MB</td><td><code>ulimit -s</code></td></tr>
+          <tr><td>页表级数</td><td>4 级（PGD→PUD→PMD→PTE）</td><td>5 级页表 57 位地址是后来加的</td></tr>
+          <tr><td>虚拟地址空间</td><td>用户 128 TB / 内核 128 TB</td><td>48 位；5 级页表可到 64 PB</td></tr>
+          <tr><td>系统调用进入点</td><td><code>syscall</code> 指令 → <code>entry_SYSCALL_64</code></td><td>老的是 <code>int 0x80</code></td></tr>
+          <tr><td>时钟中断</td><td>通常 250 / 1000 Hz</td><td><code>CONFIG_HZ</code>；一个 tick 4ms 或 1ms</td></tr>
+          <tr><td>中断上下文栈</td><td>独立 IRQ stack（16 KB）</td><td><code>CONFIG_THREAD_INFO_IN_TASK</code> 之后与 task 解耦</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="box warn">
+      <span class="box-title">为什么中断上下文不能睡眠？</span>
+      因为它没有自己的 <code>task_struct</code>（或者说它借用被中断进程的栈，而那个进程随时可能被切换走）。
+      更本质的原因有两条：<strong>① 没有可调度的实体</strong>，<code>schedule()</code> 找不到下一个可切换的上下文；
+      <strong>② 关中断期间睡眠会死锁</strong> —— 中断被关掉了，唤醒你的那个中断永远来不了。
+      所以 <code>spin_lock()</code> 在中断上下文里必须换成 <code>spin_lock_irqsave()</code>。
+    </div>
+
+    <h2 id="process">进程、线程与调度</h2>
+
+    <h3 id="task-struct">task_struct 里有什么</h3>
+    <p>
+      Linux 不区分进程和线程的调度实体，统一是 <code>task_struct</code>。进程和线程的区别体现在
+      <strong>是否共享 mm / files / signal 等资源</strong>：<code>clone()</code> 的不同 flag 决定共享什么。
+      <code>fork()</code> 就是 <code>clone(SIGCHLD, 0)</code>，<code>pthread_create()</code> 底层是
+      <code>clone(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD, ...)</code>。
+    </p>
+    <p>关键字段：</p>
+    <ul>
+      <li><code>state</code>：<code>TASK_RUNNING</code> / <code>TASK_INTERRUPTIBLE</code> / <code>TASK_UNINTERRUPTIBLE</code> / <code>__TASK_STOPPED</code> / <code>EXIT_ZOMBIE</code>。D 状态就是 uninterruptible，<code>kill -9</code> 杀不掉，通常卡在 I/O 上。</li>
+      <li><code>mm</code> / <code>active_mm</code>：内核线程 <code>mm == NULL</code>，借用前一个进程的 <code>active_mm</code>，避免切换 CR3 的开销。</li>
+      <li><code>cred</code>：权限，<code>uid/gid</code> + capability 位图。</li>
+      <li><code>nsproxy</code>：namespace，容器的隔离基础。</li>
+    </ul>
+
+    <h3 id="cfs">CFS 与 EEVDF</h3>
+    <p>
+      CFS（完全公平调度）的核心是虚拟运行时间 <code>vruntime</code>：每颗 CPU 一个红黑树，
+      按 <code>vruntime</code> 排序，永远选最小的跑。实际执行时间按权重缩放：
+      优先级高的（nice 小）<code>vruntime</code> 增长慢，于是跑得更多。
+    </p>
+    <pre><code><span class="c">// 简化的核心公式</span>
+vruntime += delta_exec * (NICE_0_WEIGHT / weight)</code></pre>
+    <p>
+      新任务入队时，<code>vruntime</code> 会被设成 <code>cfs_rq-&gt;min_vruntime</code>，
+      防止它因为 vruntime 太小而霸占 CPU。这就是 <code>sched_place_entity()</code> 里的
+      <code>place_entity()</code> 要做的事。
+    </p>
+    <div class="box">
+      <span class="box-title">2024 年之后的变化</span>
+      Linux 6.6 起默认调度器换成了 <strong>EEVDF</strong>（Earliest Eligible Virtual Deadline First），
+      引入了 <code>lag</code> 和 <code>eligible</code> 概念，解决 CFS 在延迟敏感任务上的公平性问题。
+      面试如果聊到，能说出"CFS 被 EEVDF 取代、6.6 合入"就是明显的加分。
+    </div>
+
+    <h3 id="preempt">抢占与实时</h3>
+    <ul>
+      <li><code>CONFIG_PREEMPT_NONE</code>：服务器默认，内核态不被抢占，吞吐优先。</li>
+      <li><code>CONFIG_PREEMPT_VOLUNTARY</code>：在 <code>cond_resched()</code> 处主动让出。</li>
+      <li><code>CONFIG_PREEMPT</code>：完全可抢占，除了持锁和关中断的区域。</li>
+      <li><code>CONFIG_PREEMPT_RT</code>：实时补丁，自旋锁变成可睡眠的 rtmutex，中断线程化，5.x 之后逐步合入主线，6.12 起完整合入。</li>
+    </ul>
+    <p>
+      优先级：<code>0~99</code> 是实时（SCHED_FIFO / SCHED_RR），<code>100~139</code> 是普通（SCHED_NORMAL）。
+      实时任务永远压过普通任务，如果实时任务死循环，可以用 <code>sched_rt_runtime_us</code> 给它限流（默认 95%）。
+    </p>
+
+    <h2 id="mm">内存管理</h2>
+
+    <h3 id="phys">物理内存的组织</h3>
+    <p>四级结构，从粗到细：</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>层级</th><th>结构</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>Node</td><td><code>pg_data_t</code></td><td>NUMA 节点，一颗 CPU socket 一个</td></tr>
+          <tr><td>Zone</td><td><code>ZONE_DMA</code> / <code>ZONE_DMA32</code> / <code>ZONE_NORMAL</code> / <code>ZONE_MOVABLE</code></td><td>x86-64 上 DMA32 覆盖 4G 以下，给 32 位设备</td></tr>
+          <tr><td>Page</td><td><code>struct page</code></td><td>每 4K 页一个。50 个左右的字段，所以 40GB 内存光 page 结构就占 640MB</td></tr>
+          <tr><td>Slab</td><td><code>kmem_cache</code></td><td>小对象分配器，避免内部碎片</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      伙伴系统（buddy allocator）管页：按 2 的幂次分块，分配时找不小于需求的最小块，不够就拆大块；
+      释放时看伙伴是否空闲，空闲就合并。最大连续块通常是 <code>MAX_ORDER = 11</code>，即 4MB。
+    </p>
+    <div class="box warn">
+      <span class="box-title">为什么会有内存碎片，怎么解决？</span>
+      伙伴系统只能合并"伙伴"，长时间运行后会出现大量不连续的空闲页，导致要一个 4MB 连续块时失败。
+      解法有三：<strong>①</strong> 按可迁移性给页分组（<code>MIGRATE_MOVABLE</code> / <code>UNMOVABLE</code>），
+      让可迁移的页扎堆，需要时搬一搬就能凑出连续块；<strong>②</strong> CMA（Contiguous Memory Allocator）
+      预留一块大区域，平时给可移动页用，需要时再腾出来；<strong>③</strong> 用 huge page 直接降低对连续性的需求。
+    </div>
+
+    <h3 id="vmalloc">kmalloc / vmalloc / kmem_cache</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>接口</th><th>物理连续性</th><th>适用</th><th>限制</th></tr></thead>
+        <tbody>
+          <tr><td><code>kmalloc</code></td><td>连续</td><td>小块（&lt; 4MB）、DMA 缓冲区</td><td>大块容易失败</td></tr>
+          <tr><td><code>vmalloc</code></td><td>不连续</td><td>大块、只给 CPU 访问</td><td>页表开销，不能用于 DMA</td></tr>
+          <tr><td><code>alloc_pages</code></td><td>连续（2^n 页）</td><td>页级分配</td><td>—</td></tr>
+          <tr><td><code>kmem_cache_alloc</code></td><td>连续</td><td>高频小对象</td><td>需先建 cache</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <strong>GFP flag 是重点</strong>：<code>GFP_KERNEL</code> 可以睡眠（会触发回收 / IO），
+      <code>GFP_ATOMIC</code> 不能睡眠（用于中断上下文、持自旋锁时），
+      <code>GFP_NOIO</code> / <code>GFP_NOFS</code> 用于文件系统等会重入的场景。
+    </p>
+
+    <h3 id="page-table">页表与地址翻译</h3>
+    <p>
+      x86-64 四级页表，每级 9 位索引 + 低 12 位页内偏移。CR3 指向 PGD。
+      每次进程切换如果换了 <code>mm</code>，就要写 CR3，导致 TLB 失效 —— 这是为什么内核线程借用
+      <code>active_mm</code>（不换 CR3 就不 flush）。
+    </p>
+    <p>
+      TLB 失效有两个层次：<code>invlpg</code> 指令刷单条；
+      PCID（Process Context ID）让 TLB 条目带进程标签，切换时不用全刷 —— Linux 里的
+      <code>CR3_NOFLUSH</code> 就是在用它。
+    </p>
+    <div class="box">
+      <span class="box-title">页表项里的关键位</span>
+      <code>_PAGE_PRESENT</code>（存在）、<code>_PAGE_RW</code>（可写）、<code>_PAGE_USER</code>（用户可访问）、
+      <code>_PAGE_ACCESSED</code> / <code>_PAGE_DIRTY</code>（给 LRU 和写回用）、<code>_PAGE_NX</code>（不可执行）。
+      缺页异常里 <code>error_code</code> 的 P/W/U/RSVD 位决定了这是不是合法访问 ——
+      面试问"缺页处理怎么判断是非法访问"就答这个。
+    </div>
+
+    <h3 id="page-fault">缺页处理流程</h3>
+    <ol>
+      <li>CPU 触发 <code>#PF</code>，硬件把错误码压栈，跳到 <code>exc_page_fault</code>。</li>
+      <li>判断地址在用户空间还是内核空间（<code>address &lt; TASK_SIZE_MAX</code>）。</li>
+      <li>查 VMA（<code>find_vma</code>）找到地址属于哪个区域，检查权限（读/写/执行是否允许）。</li>
+      <li>分情况：匿名页 → <code>do_anonymous_page</code>；文件页 → <code>do_fault</code> 从 page cache 或磁盘读；栈增长 → <code>expand_stack</code>；写时复制 → <code>do_wp_page</code>。</li>
+      <li>分配物理页、填页表、刷 TLB、返回用户态重试那条指令。</li>
+    </ol>
+
+    <h3 id="mmap">mmap 与驱动里的 mmap</h3>
+    <p>
+      <code>mmap</code> 把文件或设备映射到进程地址空间。用户态调 <code>mmap()</code> →
+      内核创建 VMA → 真正访问时缺页 → 调文件系统的 <code>fault</code> 回调或驱动的 <code>mmap</code>。
+    </p>
+    <p>
+      <strong>驱动里实现 mmap 要做的</strong>：把设备物理地址（比如 BAR 空间）映射进用户进程。
+      核心是 <code>remap_pfn_range()</code>，或者用 <code>vm_insert_page()</code> 插入具体的页。
+      注意必须检查偏移对齐、范围、权限，否则就是提权漏洞。
+    </p>
+    <pre><code><span class="k">static int</span> mydev_mmap(<span class="k">struct</span> file *filp, <span class="k">struct</span> vm_area_struct *vma)
+{
+    <span class="k">unsigned long</span> pfn = __pa(bar_addr) &gt;&gt; PAGE_SHIFT;
+    <span class="k">return</span> remap_pfn_range(vma, vma-&gt;vm_start, pfn,
+                           vma-&gt;vm_end - vma-&gt;vm_start, vma-&gt;vm_page_prot);
+}</code></pre>
+    <p>
+      现代驱动更推荐 <code>io_remap_pfn_range</code>（用于 IO 内存）和
+      <code>dma_mmap_coherent</code>（用于一致性 DMA 内存），后者能正确处理 cache 属性。
+    </p>
+
+    <h3 id="numa">NUMA 与内存回收</h3>
+    <p>
+      NUMA 下访问本地内存比远端快 2~3 倍。<code>numactl --hardware</code> 能看节点。
+      内核里页分配默认优先本地节点，失败才 fallback。
+    </p>
+    <p>回收有三条路径：</p>
+    <ul>
+      <li><strong>直接回收</strong>：分配时水位不足，同步回收（会造成延迟尖刺）。</li>
+      <li><strong>kswapd</strong>：后台线程，异步回收。</li>
+      <li><strong>OOM killer</strong>：实在回收不出来，按 <code>oom_score</code> 杀进程。</li>
+    </ul>
+    <p>
+      页的两种 LRU 链表（active / inactive，再分 anon / file），
+      新页先进 inactive，被访问两次才提升到 active。这就是 LRU-2 的近似实现。
+    </p>
+
+    <h2 id="concurrency">并发与同步</h2>
+    <p>这是内核面试的核心中的核心。NVIDIA 的 JD 明确写了 "synchronization and concurrency"。</p>
+
+    <h3 id="locks">锁的选择</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>原语</th><th>能否睡眠</th><th>中断上下文</th><th>适用场景</th></tr></thead>
+        <tbody>
+          <tr><td><code>spinlock</code></td><td>否</td><td>可用（需 irqsave）</td><td>短临界区，进程/软中断上下文</td></tr>
+          <tr><td><code>mutex</code></td><td>是</td><td>不可用</td><td>可能长时间持锁、需要睡眠</td></tr>
+          <tr><td><code>semaphore</code></td><td>是</td><td>不可用</td><td>计数型，历史遗留</td></tr>
+          <tr><td><code>rwlock</code> / <code>rwsem</code></td><td>spin 版否 / sem 版是</td><td>—</td><td>读多写少</td></tr>
+          <tr><td><code>RCU</code></td><td>读侧否，写侧可</td><td>读侧可用</td><td>读极多写极少（链表、路由表）</td></tr>
+          <tr><td><code>seqlock</code></td><td>否</td><td>可用</td><td>写少读多且数据小（时间戳、jiffies）</td></tr>
+          <tr><td><code>atomic_t</code></td><td>否</td><td>可用</td><td>简单计数器</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 id="irq-save">为什么 spin_lock_irqsave 而不是 spin_lock_irq</h3>
+    <pre><code><span class="c">// 错误：无条件开中断，会把外层关的中断也打开</span>
+spin_lock_irq(&amp;lock);
+...
+spin_unlock_irq(&amp;lock);   <span class="c">// 这里会开中断！</span>
+
+<span class="c">// 正确：保存原有状态，恢复时原样还原</span>
+<span class="k">unsigned long</span> flags;
+spin_lock_irqsave(&amp;lock, flags);
+...
+spin_unlock_irqrestore(&amp;lock, flags);</code></pre>
+    <p>
+      如果锁只在进程上下文用，<code>spin_lock</code> 就够；如果软中断也会拿这把锁，
+      需要 <code>spin_lock_bh</code>；如果硬中断也会拿，需要 <code>spin_lock_irqsave</code>。
+    </p>
+
+    <h3 id="rcu">RCU 原理</h3>
+    <p>
+      RCU 的核心思想：<strong>读侧零开销，写侧延迟释放</strong>。
+      读者在 <code>rcu_read_lock()</code> 和 <code>rcu_read_unlock()</code> 之间持有引用，
+      写者先移除指针（<code>rcu_assign_pointer</code> 更新），然后等所有读者退出临界区
+      （<code>synchronize_rcu()</code>），才真正 <code>kfree()</code> 旧对象。
+    </p>
+    <pre><code><span class="c">// 写侧</span>
+new = kmalloc(...);
+copy(old, new);
+rcu_assign_pointer(list-&gt;entry, new);
+synchronize_rcu();     <span class="c">// 等所有读者离开</span>
+kfree(old);
+
+<span class="c">// 读侧</span>
+rcu_read_lock();
+p = rcu_dereference(list-&gt;entry);
+<span class="c">// 使用 p，不能睡眠</span>
+rcu_read_unlock();</code></pre>
+    <div class="box">
+      <span class="box-title">grace period 为什么能确定读者退出</span>
+      经典 RCU 依赖 <strong>静止态（quiescent state）</strong>：CPU 发生上下文切换、用户态执行、
+      或进入 idle，都说明它肯定不在 RCU 读临界区里了。所以只要所有 CPU 都经过一次静止态，
+      就说明没有老读者了。这也是为什么 RCU 读侧不能睡眠 —— 睡眠会导致上下文切换，
+      而读者还没用完对象。
+    </div>
+
+    <h3 id="atomics">内存屏障与原子操作</h3>
+    <p>三种屏障：</p>
+    <ul>
+      <li><code>barrier()</code>：编译器屏障，只阻止编译器重排。</li>
+      <li><code>smp_mb()</code>：全屏障，阻止 CPU 重排。</li>
+      <li><code>smp_rmb()</code> / <code>smp_wmb()</code>：读/写屏障。</li>
+      <li><code>smp_read_barrier_depends()</code>：数据依赖屏障，在 Alpha / 弱一致性架构上需要。</li>
+    </ul>
+    <p>
+      经典用法是无锁队列 / 环形缓冲区。比如生产者在写满数据之后才更新 <code>tail</code>，
+      消费者看到 <code>tail</code> 变化才能读数据 —— 这中间需要 <code>smp_wmb()</code>。
+    </p>
+    <pre><code><span class="c">// 单生产者单消费者环形队列</span>
+<span class="c">// 生产者</span>
+buf[tail % N] = data;
+smp_wmb();                    <span class="c">// 确保数据先写入，再更新 tail</span>
+WRITE_ONCE(tail, tail + 1);
+
+<span class="c">// 消费者</span>
+<span class="k">if</span> (READ_ONCE(tail) == head) <span class="k">return</span> EMPTY;
+smp_rmb();
+data = buf[head % N];
+head++;</code></pre>
+
+    <h2 id="interrupt">中断、软中断与下半部</h2>
+
+    <h3 id="top-bottom">上半部与下半部</h3>
+    <p>
+      中断处理要尽可能快，因为关中断期间系统失去响应。所以拆成两半：
+    </p>
+    <ul>
+      <li><strong>上半部（hardirq）</strong>：关中断执行，只做最紧急的事 —— 读状态、清中断标志、唤醒下半部。不能睡眠。</li>
+      <li><strong>下半部</strong>：稍后执行，做耗时工作。有三种机制：
+        <ul>
+          <li><code>softirq</code>：静态注册，同一类可以在多 CPU 并行，用于网络、块设备、定时器。</li>
+          <li><code>tasklet</code>：基于 softirq，同一 tasklet 串行执行，适合驱动。新代码不太推荐了。</li>
+          <li><code>workqueue</code>：在进程上下文执行，<strong>可以睡眠</strong>，最灵活。</li>
+        </ul>
+      </li>
+    </ul>
+    <div class="box warn">
+      <span class="box-title">选哪个？</span>
+      需要睡眠（拿 mutex、做 IO）→ workqueue。
+      不需要睡眠且要求低延迟 → tasklet。
+      内核基础设施（网络、块）→ softirq。
+      现代驱动基本都用 workqueue 或 threaded irq（<code>request_threaded_irq</code>）。
+    </div>
+
+    <h3 id="irqflow">中断处理的完整路径</h3>
+    <ol>
+      <li>硬件发中断 → CPU 查 IDT → 跳到 <code>common_interrupt</code>。</li>
+      <li><code>irq_enter()</code> 更新统计，<code>generic_handle_irq()</code> 找到中断控制器对应的 <code>irq_desc</code>。</li>
+      <li>调 <code>irq_desc-&gt;handle_irq</code>（比如 <code>handle_edge_irq</code>），它会调注册的 handler。</li>
+      <li>handler 返回 <code>IRQ_WAKE_THREAD</code> 则唤醒 threaded handler。</li>
+      <li><code>irq_exit()</code> 里检查是否有待处理的 softirq，有就 <code>__do_softirq()</code>。</li>
+    </ol>
+
+    <h3 id="irq-affinity">中断亲和性</h3>
+    <p>
+      <code>/proc/irq/&lt;n&gt;/smp_affinity</code> 设置某个中断由哪些 CPU 处理。
+      高性能场景要把网卡中断绑到与业务进程同 NUMA 节点的 CPU 上，避免跨节点访问。
+      <code>irqbalance</code> 会自动做这件事，但有时会帮倒忙。
+    </p>
+
+    <h2 id="driver">设备驱动模型</h2>
+
+    <h3 id="bus-dev-drv">总线 / 设备 / 驱动</h3>
+    <p>
+      Linux 2.6 之后统一成 <code>bus_type</code> / <code>device</code> / <code>device_driver</code> 三件套。
+      probe 的触发流程：设备注册 → 总线遍历驱动看是否 <code>match</code> → 匹配上就调 <code>probe()</code>。
+    </p>
+    <pre><code><span class="k">struct</span> platform_driver mydrv = {
+    .probe  = my_probe,       <span class="c">// 匹配上了，初始化硬件</span>
+    .remove = my_remove,      <span class="c">// 卸载或设备移除</span>
+    .driver = {
+        .name = <span class="s">"mydev"</span>,
+        .of_match_table = my_of_match,   <span class="c">// 设备树匹配</span>
+        .acpi_match_table = my_acpi_match,
+    },
+};
+
+<span class="c">// 老式：通过 name 字符串匹配</span>
+<span class="c">// 新式：通过设备树的 compatible 属性匹配</span></code></pre>
+
+    <h3 id="char-dev">字符设备</h3>
+    <p>三件套：<code>alloc_chrdev_region</code> → <code>cdev_init</code> → <code>cdev_add</code>。</p>
+    <pre><code><span class="k">static const struct</span> file_operations my_fops = {
+    .owner   = THIS_MODULE,
+    .open    = my_open,
+    .release = my_release,
+    .read    = my_read,
+    .write   = my_write,
+    .unlocked_ioctl = my_ioctl,
+    .mmap    = my_mmap,
+    .poll    = my_poll,
+};</code></pre>
+    <p>
+      <strong>ioctl 设计要点</strong>：用 <code>_IO</code> / <code>_IOR</code> / <code>_IOW</code> / <code>_IOWR</code>
+      宏生成命令号，把方向、大小、类型编码进去，这样内核能在 copy_from_user 前校验长度。
+      不要自定义裸整数命令号，容易和别人冲突。
+    </p>
+    <p>
+      <strong>read/write 返回值的坑</strong>：返回实际字节数；返回 0 表示 EOF；
+      返回 <code>-EFAULT</code> 表示用户地址非法；<code>-EAGAIN</code> 表示非阻塞下无数据（要配合 poll 用）。
+      短读短写是合法的，用户态要循环。
+    </p>
+
+    <h3 id="poll">poll / epoll 支持</h3>
+    <pre><code><span class="k">static unsigned int</span> my_poll(<span class="k">struct</span> file *f, poll_table *wait)
+{
+    <span class="k">struct</span> my_dev *dev = f-&gt;private_data;
+    <span class="k">unsigned int</span> mask = 0;
+
+    poll_wait(f, &amp;dev-&gt;readq, wait);   <span class="c">// 注册等待队列</span>
+    <span class="k">if</span> (has_data(dev)) mask |= POLLIN | POLLRDNORM;
+    <span class="k">if</span> (can_write(dev)) mask |= POLLOUT | POLLWRNORM;
+    <span class="k">return</span> mask;
+}</code></pre>
+    <p>
+      注意 <code>poll_wait</code> 只是注册回调，不阻塞。<code>epoll</code> 的 ET 模式下，
+      必须把数据读到 <code>-EAGAIN</code> 才返回，否则不会再触发。
+    </p>
+
+    <h3 id="dma">DMA</h3>
+    <p>两种映射：</p>
+    <ul>
+      <li><strong>一致性映射</strong>（<code>dma_alloc_coherent</code>）：CPU 和设备看到的内存一致，硬件维护 cache 一致性。适合长期存在、频繁访问的缓冲区。可能分配在非缓存区，访问慢。</li>
+      <li><strong>流式映射</strong>（<code>dma_map_single</code> / <code>dma_map_sg</code>）：每次传输前映射，传输后 <code>dma_unmap_single</code>。适合单次传输。</li>
+    </ul>
+    <p>
+      关键点：<strong>设备看到的是总线地址（dma_addr_t），不是物理地址</strong>。
+      有 IOMMU 时两者完全不同，必须用 <code>virt_to_phys</code> 会错。正确做法是用
+      <code>dma_map_*</code> 系列接口。
+    </p>
+    <div class="box danger">
+      <span class="box-title">常见 bug</span>
+      <code>kmalloc</code> 分配的缓冲区如果超过 cache line 且和其他数据共享 cache line，
+      <code>dma_sync_single_for_cpu/device</code> 会破坏相邻数据（false sharing）。
+      大缓冲区要按 cache line 对齐（<code>____cacheline_aligned</code>）。
+    </div>
+
+    <h3 id="sysfs">sysfs / procfs / debugfs</h3>
+    <ul>
+      <li><code>sysfs</code>：<code>/sys</code>，展示设备树、驱动、总线的层次结构，每种 kobject 一个目录。属性用 <code>DEVICE_ATTR</code> 宏定义。</li>
+      <li><code>procfs</code>：<code>/proc</code>，进程信息和内核状态，新代码不推荐加东西。</li>
+      <li><code>debugfs</code>：<code>/sys/kernel/debug</code>，专门调试用，可以读写任意数据，没有 ABI 稳定性承诺。</li>
+    </ul>
+
+    <h2 id="fs">文件系统与 IO</h2>
+    <h3 id="vfs">VFS 四件套</h3>
+    <p><code>super_block</code> / <code>inode</code> / <code>dentry</code> / <code>file</code>。</p>
+    <ul>
+      <li><code>super_block</code>：一个挂载的文件系统实例。</li>
+      <li><code>inode</code>：一个文件（元数据），文件系统相关。</li>
+      <li><code>dentry</code>：目录项，路径的一次解析结果，有 dcache 缓存。</li>
+      <li><code>file</code>：打开的文件描述，包含偏移量和操作表。</li>
+    </ul>
+    <p>
+      一个 inode 可以有多个 dentry（硬链接），一个文件可以被多次 open 得到多个 file 结构。
+      这就是 <code>unlink</code> 之后文件还在的原因 —— inode 的引用计数还没到 0。
+    </p>
+
+    <h3 id="pagecache">page cache 与 writeback</h3>
+    <p>
+      读文件先查 page cache，没有才读磁盘。写文件默认是 write-back：先写 cache，
+      标记 dirty，由内核线程 <code>kworker</code> 按 <code>dirty_ratio</code> 刷盘。
+      <code>fsync()</code> 强制刷盘并等完成，<code>fdatasync()</code> 只刷数据不刷元数据。
+    </p>
+    <div class="box warn">
+      <span class="box-title">为什么数据库都要 fsync</span>
+      因为 write() 返回成功只代表写进了 page cache，断电就丢了。
+      所以数据库的 WAL 机制每一步都要 fsync（或用 O_DIRECT 绕过 cache）。
+      这也是为什么 <code>O_DIRECT</code> 在小 IO 上反而慢 —— 没有 cache 合并。
+    </div>
+
+    <h3 id="io-sched">IO 调度</h3>
+    <p>
+      <code>mq-deadline</code>（默认，保证截止时间）、<code>bfq</code>（桌面，公平性）、<code>kyber</code>（快速设备）。
+      对于 NVMe 这类高性能设备，调度开销可能大于收益，可以直接用 <code>none</code>。
+    </p>
+
+    <h2 id="qa">高频问答</h2>
+
+    <details class="qa">
+      <summary>进程、线程、协程在内核层面有什么区别？</summary>
+      <div class="a">
+        <p>内核只认 <code>task_struct</code>。进程和线程的区别是资源共享：进程有独立的 mm、文件表、信号处理；
+        线程共享这些。协程完全是用户态概念，内核看不见，一个协程对应多个用户态栈帧，
+        由语言运行时调度到 OS 线程上。</p>
+        <p>关键点：线程切换要陷入内核（或至少切栈），协程切换纯用户态，所以协程切换成本是纳秒级，
+        线程是微秒级。<code>io_uring</code> 和 <code>epoll</code> 让 IO 不需要线程阻塞等待，
+        这是现代高并发服务的基础。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>一个 malloc 之后，从用户态到物理内存，中间发生了什么？</summary>
+      <div class="a">
+        <p>① <code>malloc</code> 小于 128KB 时走 brk 堆，直接移动 program break；
+        大于 128KB 走 <code>mmap</code> 建立匿名映射。</p>
+        <p>② 此时只是建立了 VMA，<strong>还没有分配物理页</strong>（延迟分配 / overcommit）。</p>
+        <p>③ 第一次访问触发缺页异常 → 内核分配物理页 → 填页表 → 刷 TLB。</p>
+        <p>④ 如果系统内存紧张，页可能被换出到 swap，访问时再换回来。</p>
+        <p>追问：<code>malloc(0)</code> 返回什么？合法实现可以返回 NULL 或一个可 free 的指针，
+        glibc 返回一个最小块。<code>free</code> 之后内存去哪了？小的进 tcache / fastbin，不一定还给 OS。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>写时复制（COW）的完整流程</summary>
+      <div class="a">
+        <p><code>fork()</code> 时不复制页表，父子共享物理页，页表项都设成只读，引用计数 +1。</p>
+        <p>任何一方写 → 触发写保护缺页（<code>do_wp_page</code>）→ 分配新页 → 复制内容 → 改为可写。</p>
+        <p>优化点：<code>fork()</code> 时如果页是只读的（比如代码段），可以永久共享，不用写时复制。</p>
+        <p>面试常问：为什么 <code>fork()</code> 之后子进程调用 <code>exec()</code> 会浪费？
+        因为复制了一堆马上要丢弃的页。所以有 <code>vfork()</code> 和 <code>posix_spawn</code>，
+        以及 Linux 的 <code>clone(CLONE_VM)</code>。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>自旋锁和互斥锁，什么时候用哪个？</summary>
+      <div class="a">
+        <p><strong>自旋锁</strong>：临界区极短（几个指令），且不能睡眠，用于中断上下文。
+        自旋期间浪费 CPU，所以临界区必须短。</p>
+        <p><strong>互斥锁</strong>：可能长时间持有，允许睡眠。睡眠时让出 CPU，适合可能阻塞的操作（IO、大块内存分配）。</p>
+        <p>选错会死锁：中断上下文里用 <code>mutex_lock</code> 直接 <code>BUG</code>（<code>might_sleep</code> 检查会报）。
+        进程上下文里持有自旋锁去 <code>kmalloc(GFP_KERNEL)</code> 也是 BUG。</p>
+        <p>进阶：优先用 lockless 设计（RCU、原子操作、per-CPU 变量），能不锁就不锁。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>如何实现一个高性能的无锁环形缓冲区？</summary>
+      <div class="a">
+        <p>单生产者单消费者最简单：<code>head</code> / <code>tail</code> 两个原子变量，
+        生产者只改 tail，消费者只改 head，用 <code>smp_wmb</code> / <code>smp_rmb</code> 保证顺序，
+        不需要 CAS。</p>
+        <p>多生产者需要 CAS 循环更新 tail；或者用 <code>lwsync</code> 之类的屏障组合。
+        更常见的是用 per-CPU 队列避免竞争，或者用 <code>io_uring</code> 那种共享内存 + 原子索引的方案。</p>
+        <p>关键点：<strong>ABA 问题</strong>（值改回原样导致 CAS 误判）、<strong>伪共享</strong>（head/tail 在同一 cache line 上，
+        需要 padding 到 64 字节对齐）。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>内核 panic 了怎么定位？</summary>
+      <div class="a">
+        <p>① 看 <code>dmesg</code> / 串口日志，找 <code>RIP</code> 指向哪行代码、<code>Call Trace</code> 调用栈。</p>
+        <p>② 有 <code>vmcore</code> 的话用 <code>crash</code> 分析（<code>crash vmlinux vmcore</code>），
+        可以看寄存器、栈、内存、任务列表。</p>
+        <p>③ Oops 之外还有 <code>BUG_ON</code> / <code>WARN_ON</code> 的区别：
+        WARN 只打印不挂，BUG 直接 die。</p>
+        <p>④ 偶发的可以用 kdump / kexec 保留现场，用 <code>pstore</code> 存到 NVRAM。</p>
+        <p>⑤ 竞态类问题用 KCSAN（内核并发检查器），内存越界用 KASAN，也都能用
+        syzkaller 做模糊测试。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>用户态和内核态之间怎么高效传输数据？</summary>
+      <div class="a">
+        <p>传统是 <code>copy_to_user</code>，两次拷贝（用户→内核→设备），有开销。</p>
+        <p>零拷贝方案：</p>
+        <ul>
+          <li><code>mmap</code> 设备内存或 DMA 缓冲区到用户态，双方直接访问。</li>
+          <li>共享内存 + 无锁队列（<code>io_uring</code> 就是这种，内核和用户共享 ring buffer）。</li>
+          <li>大块传输用 DMA scatter-gather，避免 CPU 参与。</li>
+        </ul>
+        <p>GPU 驱动的 UMD/KMD 分层就是这个思路：UMD 直接在用户态填命令缓冲区，
+        通过共享内存提交给硬件，只有需要内核介入时才 ioctl。</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>怎么保证驱动代码在 SMP 下是正确的？</summary>
+      <div class="a">
+        <p>① <strong>明确数据的所有权和访问上下文</strong>：哪些数据只在进程上下文访问，哪些会被中断访问。
+        画出锁的层次图，避免锁顺序反转。</p>
+        <p>② <strong>用 lockdep</strong>：<code>CONFIG_PROVE_LOCKING</code> 能检测锁顺序反转、死锁、缺失解锁。</p>
+        <p>③ <strong>用 KCSAN</strong> 检测数据竞争。</p>
+        <p>④ <strong>用 smatch / sparse</strong> 静态检查。</p>
+        <p>⑤ <strong>压力测试</strong>：并发 + 注入延迟 + CPU 热插拔 + 内存压力同时来。</p>
+        <p>⑥ <strong>代码审查</strong>：每一处共享变量都要能说出"谁写、谁读、用什么保护"。</p>
+      </div>
+    </details>
+
+    <div class="box ok" style="margin-top:34px">
+      <span class="box-title">下一步</span>
+      读完这一页，去 <a href="../quiz/index.html?cat=kernel">刷内核专题的题</a>，
+      检验一下"数字"和"锁的选择"这两块。然后进入 <a href="gpu.html">GPU 软件栈</a>。
+    </div>
+  </main>
+</div>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>
